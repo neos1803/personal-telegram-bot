@@ -1,0 +1,17 @@
+{
+  "name": "personal-telegram-bot",
+  "version": "1.0.0",
+  "description": "Telegram API cron job",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "@openrouter/ai-sdk-provider": "^1.2.5",
+    "@gitbeaker/rest": "^39.10.2",
+    "ai": "^5.0.99",
+    "axios": "^1.6.0",
+    "dotenv": "^17.2.4",
+    "node-cron": "^3.0.0"
+  }
+}
