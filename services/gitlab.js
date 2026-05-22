@@ -62,8 +62,17 @@ async function getRecentContributions(days = 7) {
  */
 async function getUserByUsername(username) {
   try {
-    const results = await api.Users.showCurrentUser();
-    return results && results.length ? results : null;
+    const user = await api.Users.showCurrentUser();
+
+    if (!user) {
+      return null;
+    }
+
+    if (username && user.username && user.username !== username) {
+      console.warn(`GitLab token resolved to user ${user.username}, which does not match configured GITLAB_USERNAME ${username}.`);
+    }
+
+    return user;
   } catch (error) {
     console.error('Error fetching GitLab user:', error.message);
     throw error;

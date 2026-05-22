@@ -7,10 +7,12 @@
     "start": "node index.js"
   },
   "dependencies": {
-    "@openrouter/ai-sdk-provider": "^1.2.5",
+    "@azure/storage-blob": "12.26.0",
     "@gitbeaker/rest": "^39.10.2",
+    "@openrouter/ai-sdk-provider": "^1.2.5",
     "ai": "^5.0.99",
     "axios": "^1.6.0",
+    "better-sqlite3": "^11.10.0",
     "dotenv": "^17.2.4",
     "node-cron": "^3.0.0"
   }
