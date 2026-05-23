@@ -2,6 +2,7 @@ const ROLE_LABELS = {
   inbound: 'user',
   outbound: 'assistant'
 };
+const { formatIndonesianPromptTimestamp } = require('./time');
 
 function buildConversationSnapshot({ historyMessages = [], currentBatch = [] }) {
   const currentBatchIds = new Set(currentBatch.map((message) => message.id));
@@ -27,7 +28,7 @@ function formatMessages(messages, emptyValue) {
 
 function formatMessageForPrompt(message) {
   const role = ROLE_LABELS[message.direction] || (message.isFromBot ? 'assistant' : 'user');
-  const timestamp = message.occurredAt;
+  const timestamp = formatIndonesianPromptTimestamp(message.occurredAt);
   const content = message.textContent || formatMessageFallback(message);
   const artifactSummary = formatArtifactSummary(message.artifacts);
 

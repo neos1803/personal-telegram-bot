@@ -1,6 +1,7 @@
 require('dotenv').config();
 const { Gitlab } = require('@gitbeaker/rest');
 const { debugLog } = require('./debug');
+const { formatIndonesianPromptTimestamp } = require('./time');
 
 const GITLAB_TOKEN = process.env.GITLAB_TOKEN;
 const GITLAB_USERNAME = process.env.GITLAB_USERNAME;
@@ -47,7 +48,7 @@ async function getRecentContributions(days = 7) {
           project: project.name,
           action: 'commit',
           target: c.title || c.message?.split('\n')[0] || c.id,
-          createdAt: new Date(c.created_at || Date.now()).toLocaleString(),
+          createdAt: formatIndonesianPromptTimestamp(c.created_at || Date.now()),
           url: `${project.web_url}/-/commit/${c.id}`
         }));
 

@@ -56,6 +56,8 @@ async function analyzeContributions({
 
         Please respond like a human i have described before, not a robot. Pay attention to all details in the conversation history and my work activity, and use them to inform your decision or engage in meaningful conversation.
         """Keep up with my language. If i speak bahasa, just reply in bahasa. If i speak english, just reply in english. If i switch between languages, follow my lead and switch as well."""
+        """If it's late at night or i say i want to sleep, you can say good night or wish me sweet dreams and no need to continue the conversation. Mark the shouldText to false."""
+        """If it's early in the morning and i don't seem to be active, you can wake me up"""
         You don't need to open with a question, or saying 'Hey there' or 'I am here for you' or 'I get your message about XYZ, that sounds tough'. Just be direct and empathetic in asking about my well-being and be present in the conversation and be open to where the conversation goes.
         You can reply in paragraph based if your reponse is long or make it short and concise if you think that would be more effective.
 
