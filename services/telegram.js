@@ -1,5 +1,7 @@
 require('dotenv').config();
 const axios = require('axios');
+const { spawn } = require('child_process');
+const ffmpegPath = require('ffmpeg-static');
 
 const {
   getLastTelegramUpdateId,
@@ -8,13 +10,17 @@ const {
   saveOutboundMessage,
   setLastTelegramUpdateId
 } = require('./persistence');
+const { synthesizeSpeech } = require('./speech');
 const { archiveArtifact, isAzureBlobStorageConfigured } = require('./storage');
+const { debugLog } = require('./debug');
 
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_USERNAME = process.env.TELEGRAM_USERNAME;
 const TELEGRAM_FETCH_LIMIT = Number.parseInt(process.env.TELEGRAM_FETCH_LIMIT ?? '25', 10);
 const TELEGRAM_MAX_MESSAGE_LENGTH = 4096;
 const DEFAULT_TELEGRAM_CHUNK_DELAY_MS = 800;
+const DEFAULT_TELEGRAM_VOICE_REPLY_CHANCE = 0.2;
+const TELEGRAM_VOICE_MIME_TYPE = 'audio/ogg';
 
 function assertConfiguration() {
   if (!TELEGRAM_BOT_TOKEN) {
@@ -39,6 +45,11 @@ async function callTelegram(method, payload = {}) {
 
 async function ingestUpdates(batchDelayMs) {
   pruneExpiredData();
+
+  debugLog('telegram', 'Polling Telegram updates', {
+    batchDelayMs,
+    fetchLimit: TELEGRAM_FETCH_LIMIT
+  });
 
   const lastUpdateId = getLastTelegramUpdateId();
   const updates = await callTelegram('getUpdates', {
@@ -88,6 +99,35 @@ async function ingestUpdates(batchDelayMs) {
 
 async function sendTelegramMessage(chatId = '', text = '', options = {}) {
   const textChunks = splitOutgoingTextIntoMessages(text);
+
+  if (!textChunks.length) {
+    return [];
+  }
+
+  if (shouldSendVoiceReply(options)) {
+    debugLog('telegram', 'Selected voice reply mode', {
+      chatId,
+      chunkCount: textChunks.length,
+      totalLength: textChunks.join('\n\n').length
+    });
+
+    try {
+      return await sendTelegramVoiceMessage(chatId, textChunks, options);
+    } catch (error) {
+      console.error(`Error sending Telegram voice reply for chat ${chatId}, falling back to text:`, error.message);
+    }
+  }
+
+  debugLog('telegram', 'Selected text reply mode', {
+    chatId,
+    chunkCount: textChunks.length,
+    totalLength: textChunks.join('\n\n').length
+  });
+
+  return sendTelegramTextMessage(chatId, textChunks, options);
+}
+
+async function sendTelegramTextMessage(chatId = '', textChunks = [], options = {}) {
   const results = [];
   const sendMessageFn = options.sendMessageFn || ((payload) => callTelegram('sendMessage', payload));
   const persistMessageFn = options.persistMessageFn || saveOutboundMessage;
@@ -101,9 +141,22 @@ async function sendTelegramMessage(chatId = '', text = '', options = {}) {
       parse_mode: 'HTML'
     });
 
-    const normalizedMessage = normalizeOutboundMessage(result);
+    const normalizedMessage = normalizeOutboundMessage(
+      attachBotDeliveryMetadata(result, {
+        deliveryKind: 'text',
+        chunkIndex: index + 1,
+        chunkCount: textChunks.length
+      })
+    );
     persistMessageFn(normalizedMessage);
     results.push(result);
+
+    debugLog('telegram', 'Sent text chunk', {
+      chatId,
+      chunkIndex: index + 1,
+      chunkCount: textChunks.length,
+      textLength: chunk.length
+    });
 
     if (index < textChunks.length - 1 && chunkDelayMs > 0) {
       await sleepFn(chunkDelayMs);
@@ -111,6 +164,166 @@ async function sendTelegramMessage(chatId = '', text = '', options = {}) {
   }
 
   return results;
+}
+
+async function sendTelegramVoiceMessage(chatId = '', textChunks = [], options = {}) {
+  const results = [];
+  const voiceSegments = await buildVoiceReplySegments(textChunks, options);
+  const sendVoiceFn = options.sendVoiceFn || ((payload) => callTelegramMultipart('sendVoice', payload));
+  const persistMessageFn = options.persistMessageFn || saveOutboundMessage;
+  const sleepFn = options.sleepFn || waitForDelay;
+  const chunkDelayMs = options.chunkDelayMs ?? getTelegramChunkDelayMs();
+
+  for (const [index, segment] of voiceSegments.entries()) {
+    const result = await sendVoiceFn({
+      chat_id: chatId,
+      voice: createTelegramBinaryFile(
+        segment.voiceBuffer,
+        `voice-reply-${index + 1}.ogg`,
+        TELEGRAM_VOICE_MIME_TYPE
+      )
+    });
+
+    const normalizedMessage = normalizeOutboundMessage(
+      attachBotDeliveryMetadata(result, {
+        deliveryKind: 'voice',
+        chunkIndex: index + 1,
+        chunkCount: voiceSegments.length,
+        generationId: segment.generationId,
+        sourceContentType: segment.sourceContentType,
+        ttsModel: segment.ttsModel,
+        ttsVoice: segment.ttsVoice
+      }),
+      {
+        textContentOverride: segment.persistedText
+      }
+    );
+    persistMessageFn(normalizedMessage);
+    results.push(result);
+
+    debugLog('telegram', 'Sent Telegram voice note', {
+      chatId,
+      chunkIndex: index + 1,
+      chunkCount: voiceSegments.length,
+      textLength: segment.persistedText.length,
+      generationId: segment.generationId
+    });
+
+    if (index < voiceSegments.length - 1 && chunkDelayMs > 0) {
+      await sleepFn(chunkDelayMs);
+    }
+  }
+
+  return results;
+}
+
+function shouldSendVoiceReply(options = {}) {
+  if (typeof options.useVoiceReply === 'boolean') {
+    return options.useVoiceReply;
+  }
+
+  const voiceReplyChance = options.voiceReplyChance ?? getTelegramVoiceReplyChance();
+
+  if (voiceReplyChance <= 0) {
+    return false;
+  }
+
+  const randomFn = options.randomFn || Math.random;
+  return randomFn() < voiceReplyChance;
+}
+
+function getTelegramVoiceReplyChance() {
+  const parsedValue = Number.parseFloat(
+    process.env.TELEGRAM_VOICE_REPLY_CHANCE ?? String(DEFAULT_TELEGRAM_VOICE_REPLY_CHANCE)
+  );
+
+  if (Number.isNaN(parsedValue)) {
+    return DEFAULT_TELEGRAM_VOICE_REPLY_CHANCE;
+  }
+
+  return Math.min(1, Math.max(0, parsedValue));
+}
+
+async function buildVoiceReplySegments(textChunks = [], options = {}) {
+  const synthesizeSpeechFn = options.synthesizeSpeechFn || synthesizeSpeech;
+  const convertVoiceBufferFn = options.convertVoiceBufferFn || convertToTelegramVoiceBuffer;
+  const ttsInstructions = buildSpeechInstructions({
+    baseInstructions: options.ttsInstructions || process.env.OPENROUTER_TTS_INSTRUCTIONS || '',
+    mood: options.ttsMood || ''
+  });
+  const segments = [];
+
+  for (const textChunk of textChunks) {
+    const speechResult = await synthesizeSpeechFn({
+      input: textChunk,
+      model: options.ttsModel || process.env.OPENROUTER_TTS_MODEL,
+      voice: options.ttsVoice || process.env.OPENROUTER_TTS_VOICE,
+      speed: options.ttsSpeed ?? getOpenRouterTtsSpeed(),
+      instructions: ttsInstructions
+    });
+    const voiceBuffer = await convertVoiceBufferFn(speechResult.audioBuffer, {
+      ffmpegPath: options.ffmpegPath || ffmpegPath,
+      sourceContentType: speechResult.contentType,
+      sourceFormat: speechResult.responseFormat,
+      ttsModel: speechResult.model
+    });
+
+    segments.push({
+      voiceBuffer,
+      persistedText: textChunk,
+      generationId: speechResult.generationId,
+      sourceContentType: speechResult.contentType,
+      ttsModel: speechResult.model,
+      ttsVoice: speechResult.voice
+    });
+
+    debugLog('telegram', 'Prepared OpenRouter voice segment', {
+      textLength: textChunk.length,
+      generationId: speechResult.generationId,
+      sourceContentType: speechResult.contentType,
+      voiceByteLength: voiceBuffer.length
+    });
+  }
+
+  return segments;
+}
+
+function buildSpeechInstructions({ baseInstructions = '', mood = '' } = {}) {
+  const trimmedBaseInstructions = String(baseInstructions || '').trim();
+  const trimmedMood = String(mood || '').trim();
+  const instructionParts = [];
+
+  if (trimmedBaseInstructions) {
+    instructionParts.push(trimmedBaseInstructions);
+  }
+
+  instructionParts.push(
+    'Deliver this as a natural Telegram voice note. Keep the pacing conversational, clear, and human.'
+  );
+  instructionParts.push(
+    'Preserve the original language of the message and avoid sounding theatrical, exaggerated, or robotic.'
+  );
+
+  if (trimmedMood) {
+    instructionParts.push(
+      `The emotional tone should subtly reflect this mood from the previous analysis result: ${trimmedMood}.`
+    );
+    instructionParts.push(
+      'Let that mood shape the warmth, energy, and delivery style naturally without changing the words of the message.'
+    );
+  }
+
+  return instructionParts.join(' ');
+}
+
+function getOpenRouterTtsSpeed() {
+  const parsedValue = Number.parseFloat(process.env.OPENROUTER_TTS_SPEED ?? '1');
+
+  if (Number.isNaN(parsedValue) || parsedValue <= 0) {
+    return 1;
+  }
+
+  return parsedValue;
 }
 
 function getTelegramChunkDelayMs() {
@@ -215,6 +428,116 @@ function waitForDelay(delayMs) {
   });
 }
 
+function createTelegramBinaryFile(data, filename, contentType) {
+  return {
+    data,
+    filename,
+    contentType
+  };
+}
+
+async function callTelegramMultipart(method, payload = {}) {
+  const formData = new FormData();
+
+  for (const [key, value] of Object.entries(payload)) {
+    if (value == null) {
+      continue;
+    }
+
+    if (isTelegramBinaryFile(value)) {
+      formData.append(
+        key,
+        new Blob([value.data], { type: value.contentType || 'application/octet-stream' }),
+        value.filename || 'upload.bin'
+      );
+      continue;
+    }
+
+    formData.append(key, String(value));
+  }
+
+  const response = await axios.post(`${getBaseUrl()}/${method}`, formData, {
+    maxBodyLength: Infinity,
+    maxContentLength: Infinity
+  });
+
+  if (!response.data?.ok) {
+    throw new Error(response.data?.description || `Telegram ${method} failed`);
+  }
+
+  return response.data.result;
+}
+
+function isTelegramBinaryFile(value) {
+  return Boolean(
+    value &&
+    typeof value === 'object' &&
+    'data' in value &&
+    'filename' in value
+  );
+}
+
+async function convertToTelegramVoiceBuffer(
+  audioBuffer,
+  {
+    ffmpegPath: resolvedFfmpegPath = ffmpegPath,
+    sourceContentType = '',
+    sourceFormat = '',
+    ttsModel = ''
+  } = {}
+) {
+  if (!resolvedFfmpegPath) {
+    throw new Error('ffmpeg executable is not available for Telegram voice conversion');
+  }
+
+  const normalizedSourceFormat = String(sourceFormat || '').toLowerCase();
+  const normalizedContentType = String(sourceContentType || '').toLowerCase();
+  const normalizedModel = String(ttsModel || '').toLowerCase();
+  const shouldTreatInputAsPcm =
+    normalizedSourceFormat === 'pcm' ||
+    normalizedContentType.includes('audio/pcm') ||
+    normalizedContentType.includes('audio/l16') ||
+    normalizedModel.includes('gemini');
+
+  const inputArgs = shouldTreatInputAsPcm
+    ? ['-f', 's16le', '-ar', '24000', '-ac', '1']
+    : [];
+
+  return new Promise((resolve, reject) => {
+    const ffmpeg = spawn(resolvedFfmpegPath, [
+      '-hide_banner',
+      '-loglevel', 'error',
+      ...inputArgs,
+      '-i', 'pipe:0',
+      '-vn',
+      '-map_metadata', '-1',
+      '-ac', '1',
+      '-c:a', 'libopus',
+      '-b:a', '48k',
+      '-application', 'voip',
+      '-f', 'ogg',
+      'pipe:1'
+    ]);
+    const stdoutChunks = [];
+    const stderrChunks = [];
+
+    ffmpeg.stdout.on('data', (chunk) => stdoutChunks.push(chunk));
+    ffmpeg.stderr.on('data', (chunk) => stderrChunks.push(chunk));
+    ffmpeg.on('error', reject);
+    ffmpeg.on('close', (code) => {
+      if (code !== 0) {
+        reject(new Error(`ffmpeg exited with code ${code}: ${Buffer.concat(stderrChunks).toString('utf8')}`));
+        return;
+      }
+
+      resolve(Buffer.concat(stdoutChunks));
+    });
+
+    ffmpeg.stdin.on('error', reject);
+    ffmpeg.stdin.end(audioBuffer);
+  });
+}
+
 function shouldTrackUpdate(update) {
   const message = update?.message;
 
@@ -267,7 +590,7 @@ async function normalizeUpdate(update) {
   };
 }
 
-function normalizeOutboundMessage(message) {
+function normalizeOutboundMessage(message, options = {}) {
   return {
     chat: normalizeChat(message.chat),
     telegramMessageId: message.message_id,
@@ -275,10 +598,20 @@ function normalizeOutboundMessage(message) {
     senderUsername: message.from?.username || null,
     senderDisplayName: buildDisplayName(message.from, message.chat),
     messageType: detectMessageType(message),
-    textContent: extractTextContent(message),
+    textContent: options.textContentOverride ?? extractTextContent(message),
     replyToMessageId: message.reply_to_message?.message_id || null,
     occurredAt: normalizeTimestamp(message.date),
     raw: message
+  };
+}
+
+function attachBotDeliveryMetadata(message, metadata = {}) {
+  return {
+    ...message,
+    _botDelivery: {
+      ...(message._botDelivery || {}),
+      ...metadata
+    }
   };
 }
 
@@ -650,9 +983,15 @@ function normalizeTimestamp(timestampInSeconds) {
 }
 
 module.exports = {
+  buildSpeechInstructions,
+  buildVoiceReplySegments,
+  convertToTelegramVoiceBuffer,
   downloadTelegramFile,
   getTelegramChunkDelayMs,
+  getOpenRouterTtsSpeed,
+  getTelegramVoiceReplyChance,
   ingestUpdates,
   sendTelegramMessage,
+  shouldSendVoiceReply,
   splitOutgoingTextIntoMessages
 };

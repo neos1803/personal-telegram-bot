@@ -1,5 +1,6 @@
 require('dotenv').config();
 const { Gitlab } = require('@gitbeaker/rest');
+const { debugLog } = require('./debug');
 
 const GITLAB_TOKEN = process.env.GITLAB_TOKEN;
 const GITLAB_USERNAME = process.env.GITLAB_USERNAME;
@@ -14,6 +15,12 @@ const api = new Gitlab({ token: GITLAB_TOKEN, host: GITLAB_HOST });
  */
 async function getRecentContributions(days = 7) {
   try {
+    debugLog('gitlab', 'Fetching recent contributions', {
+      days,
+      username: GITLAB_USERNAME,
+      host: GITLAB_HOST
+    });
+
     const user = await getUserByUsername(GITLAB_USERNAME);
     if (!user) return [];
 
@@ -50,6 +57,12 @@ async function getRecentContributions(days = 7) {
       }
     }
 
+    debugLog('gitlab', 'Fetched recent contributions', {
+      days,
+      contributionCount: contributions.length,
+      projectCount: projects.length
+    });
+
     return contributions;
   } catch (error) {
     console.error('Error fetching GitLab contributions:', error.message);
@@ -63,6 +76,12 @@ async function getRecentContributions(days = 7) {
 async function getUserByUsername(username) {
   try {
     const user = await api.Users.showCurrentUser();
+
+    debugLog('gitlab', 'Resolved GitLab user', {
+      configuredUsername: username,
+      resolvedUsername: user?.username || null,
+      userId: user?.id || null
+    });
 
     if (!user) {
       return null;

@@ -1,4 +1,3 @@
-const { createHash } = require('crypto');
 const cron = require('node-cron');
 require('dotenv').config();
 
@@ -7,10 +6,15 @@ const { analyzeContributions } = require('./services/openrouter');
 const { getActiveChats, getAppState, getRuntimeInfo, claimReadyBatches, completeBatch, getPendingMessagesForChat, getRecentMessages, markMessagesProcessed, pruneExpiredData, rescheduleBatch, setAppState } = require('./services/persistence');
 const { getBatchDelayMs } = require('./services/queue');
 const { ingestUpdates, sendTelegramMessage } = require('./services/telegram');
+const { debugLog } = require('./services/debug');
 
 const TELEGRAM_POLL_CRON = process.env.TELEGRAM_POLL_CRON || '* * * * *';
 const TELEGRAM_PROCESS_CRON = process.env.TELEGRAM_PROCESS_CRON || '* * * * *';
 const TELEGRAM_PROACTIVE_CRON = process.env.TELEGRAM_PROACTIVE_CRON || '*/30 * * * *';
+const TELEGRAM_PROACTIVE_POST_BATCH_COOLDOWN_MS = Number.parseInt(
+  process.env.TELEGRAM_PROACTIVE_POST_BATCH_COOLDOWN_MS ?? '60000',
+  10
+);
 const GITLAB_LOOKBACK_DAYS = Number.parseInt(process.env.GITLAB_LOOKBACK_DAYS ?? '1', 10);
 
 let ingestionInProgress = false;
@@ -26,6 +30,10 @@ async function runIngestion() {
   ingestionInProgress = true;
 
   try {
+    debugLog('scheduler', 'Starting Telegram ingestion tick', {
+      batchDelayMs: getBatchDelayMs()
+    });
+
     const result = await ingestUpdates(getBatchDelayMs());
 
     console.log(
@@ -53,6 +61,7 @@ async function runPendingBatchProcessing() {
     pruneExpiredData();
 
     console.log('Running batch processor at:', new Date().toISOString());
+    debugLog('scheduler', 'Starting batch processor tick');
 
     const readyBatches = claimReadyBatches();
 
@@ -65,11 +74,8 @@ async function runPendingBatchProcessing() {
 
     const contributions = await getRecentContributions(GITLAB_LOOKBACK_DAYS);
     console.log(`GitLab contribution count for this tick: ${contributions.length}`);
-    const processedChatIds = new Set();
-
     for (const batch of readyBatches) {
       try {
-        processedChatIds.add(batch.chatId);
         const currentBatch = getPendingMessagesForChat(batch.chatId);
 
         if (!currentBatch.length) {
@@ -79,6 +85,11 @@ async function runPendingBatchProcessing() {
         }
 
         const historyMessages = getRecentMessages(batch.chatId);
+        debugLog('scheduler', 'Processing ready batch', {
+          chatId: batch.chatId,
+          pendingCount: currentBatch.length,
+          historyCount: historyMessages.length
+        });
         const analysis = await analyzeContributions({
           contributions,
           workingSchedule: '',
@@ -88,16 +99,13 @@ async function runPendingBatchProcessing() {
         logAnalysisDecision('batch', batch.chatId, analysis);
 
         if (analysis?.shouldText && analysis?.text) {
-          await sendTelegramMessage(batch.chatId, analysis.text);
+          await sendTelegramMessage(batch.chatId, analysis.text, { ttsMood: analysis?.mood });
           console.log(`Sent batch-triggered reply to chat ${batch.chatId}.`);
         }
 
         markMessagesProcessed(currentBatch.map((message) => message.id));
         completeBatch(batch.chatId);
-        setAppState(
-          `proactive.last_context_hash.${batch.chatId}`,
-          buildProactiveFingerprint({ contributions, historyMessages })
-        );
+        setAppState(getPostBatchCooldownStateKey(batch.chatId), new Date().toISOString());
       } catch (error) {
         console.error(`Error processing chat batch ${batch.chatId}:`, error.message);
         rescheduleBatch(batch.chatId);
@@ -127,6 +135,7 @@ async function runScheduledProactiveWellbeingChecks() {
     pruneExpiredData();
 
     console.log('Running proactive wellbeing check at:', new Date().toISOString());
+    debugLog('scheduler', 'Starting proactive wellbeing tick');
 
     const activeChats = getActiveChats();
 
@@ -176,18 +185,25 @@ async function runProactiveWellbeingChecks({
       }
 
       const historyMessages = getRecentMessages(chat.chatId);
+      debugLog('scheduler', 'Evaluating proactive chat candidate', {
+        chatId: chat.chatId,
+        historyCount: historyMessages.length
+      });
 
       if (!historyMessages.length) {
         console.log(`Skipping proactive evaluation for chat ${chat.chatId} because no recent history is available.`);
         continue;
       }
 
-      const fingerprint = buildProactiveFingerprint({ contributions, historyMessages });
-      const stateKey = `proactive.last_context_hash.${chat.chatId}`;
+      const lastBatchHandledAt = getAppState(getPostBatchCooldownStateKey(chat.chatId));
 
-      if (getAppState(stateKey) === fingerprint) {
-        console.log(`Skipping proactive evaluation for chat ${chat.chatId} because conversation and contribution inputs are unchanged.`);
-        continue;
+      if (lastBatchHandledAt) {
+        const elapsedMs = Date.now() - Date.parse(lastBatchHandledAt);
+
+        if (Number.isFinite(elapsedMs) && elapsedMs >= 0 && elapsedMs < TELEGRAM_PROACTIVE_POST_BATCH_COOLDOWN_MS) {
+          console.log(`Skipping proactive evaluation for chat ${chat.chatId} because it was already handled by the batch processor ${elapsedMs}ms ago.`);
+          continue;
+        }
       }
 
       const analysis = await analyzeContributions({
@@ -199,31 +215,17 @@ async function runProactiveWellbeingChecks({
       logAnalysisDecision('proactive', chat.chatId, analysis);
 
       if (analysis?.shouldText && analysis?.text) {
-        await sendTelegramMessage(chat.chatId, analysis.text);
+        await sendTelegramMessage(chat.chatId, analysis.text, { ttsMood: analysis?.mood });
         console.log(`Sent proactive reply to chat ${chat.chatId}.`);
       }
-
-      setAppState(stateKey, fingerprint);
     } catch (error) {
       console.error(`Error evaluating proactive outreach for chat ${chat.chatId}:`, error.message);
     }
   }
 }
 
-function buildProactiveFingerprint({ contributions = [], historyMessages = [] } = {}) {
-  const inboundMessages = historyMessages
-    .filter((message) => message.direction === 'inbound')
-    .map((message) => ({
-      id: message.id,
-      occurredAt: message.occurredAt,
-      messageType: message.messageType,
-      textContent: message.textContent,
-      artifacts: (message.artifacts || []).map((artifact) => artifact.id)
-    }));
-
-  return createHash('sha256')
-    .update(JSON.stringify({ contributions, inboundMessages }))
-    .digest('hex');
+function getPostBatchCooldownStateKey(chatId) {
+  return `proactive.last_batch_handled_at.${chatId}`;
 }
 
 function logAnalysisDecision(mode, chatId, analysis) {
