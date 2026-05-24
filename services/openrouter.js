@@ -4,6 +4,7 @@ const { generateText } = require('ai');
 const { buildConversationSnapshot } = require('./context');
 const { buildCurrentBatchUserContent } = require('./media');
 const { debugLog } = require('./debug');
+const { formatIndonesianPromptTimestamp, INDONESIAN_PROMPT_TIME_ZONE_LABEL } = require('./time');
 
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
 const openRouter = createOpenRouter({
@@ -23,6 +24,7 @@ async function analyzeContributions({
       currentBatch
     });
     const currentBatchContent = await buildCurrentBatchUserContent(currentBatch);
+    const currentIndonesianTime = formatIndonesianPromptTimestamp(Date.now());
 
     debugLog('openrouter', 'Generating chat analysis', {
       contributionCount: contributions.length,
@@ -46,20 +48,26 @@ async function analyzeContributions({
         Work activity JSON:
         ${contributionsSummary}
 
+        Current Indonesian date/time:
+        ${currentIndonesianTime}
+
         Working schedule:
         ${workingSchedule || 'Nothing found'}
 
         Recent 3-day conversation history:
         ${conversationSnapshot.historyText}
 
+        All timestamps provided in the conversation history and work activity are already expressed in Indonesian time (${INDONESIAN_PROMPT_TIME_ZONE_LABEL}). Treat them as the local timeline when deciding whether it is morning, late at night, a new day, or when something happened.
+
         There may be no new inbound user messages in the current batch. You are allowed to proactively text me based on work activity and recent conversation history alone.
 
         Please respond like a human i have described before, not a robot. Pay attention to all details in the conversation history and my work activity, and use them to inform your decision or engage in meaningful conversation.
+        You don't need to open with a question, or saying 'Hey there' or 'I am here for you' or 'I get your message about XYZ, that sounds tough'. Just be direct and empathetic in asking about my well-being and be present in the conversation and be open to where the conversation goes.
+        You can reply in paragraph based if your reponse is long or make it short and concise if you think that would be more effective.        
         """Keep up with my language. If i speak bahasa, just reply in bahasa. If i speak english, just reply in english. If i switch between languages, follow my lead and switch as well."""
         """If it's late at night or i say i want to sleep, you can say good night or wish me sweet dreams and no need to continue the conversation. Mark the shouldText to false."""
         """If it's early in the morning and i don't seem to be active, you can wake me up"""
-        You don't need to open with a question, or saying 'Hey there' or 'I am here for you' or 'I get your message about XYZ, that sounds tough'. Just be direct and empathetic in asking about my well-being and be present in the conversation and be open to where the conversation goes.
-        You can reply in paragraph based if your reponse is long or make it short and concise if you think that would be more effective.
+        """I usually go to sleep around 11pm and wake up around 7am, but sometimes i sleep earlier or later than that, so pay attention to any cues in the conversation history about my sleep schedule and adjust your behavior accordingly."""
 
         Return ONLY valid JSON following this exact schema:
         {

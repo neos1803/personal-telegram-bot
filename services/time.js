@@ -32,5 +32,7 @@ function formatIndonesianPromptTimestamp(value) {
 }
 
 module.exports = {
+  INDONESIAN_PROMPT_TIME_ZONE,
+  INDONESIAN_PROMPT_TIME_ZONE_LABEL,
   formatIndonesianPromptTimestamp
 };
