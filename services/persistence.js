@@ -4,6 +4,7 @@ const Database = require('better-sqlite3');
 
 const DEFAULT_RETENTION_DAYS = 3;
 const DEFAULT_STALE_BATCH_MS = 10 * 60 * 1000;
+const DEFAULT_STALE_PROACTIVE_JOB_MS = 10 * 60 * 1000;
 const DEFAULT_RUNTIME_DIR = path.join(process.cwd(), '.runtime');
 const RUNTIME_DIR = process.env.RUNTIME_DATA_DIR
   ? path.resolve(process.env.RUNTIME_DATA_DIR)
@@ -83,6 +84,36 @@ const insertInboundMessageStatement = db.prepare(`
     @occurredAt,
     @rawJson
   )
+`);
+
+const upsertProactiveJobStatement = db.prepare(`
+  INSERT INTO proactive_jobs (
+    chat_id,
+    due_at,
+    requested_delay_minutes,
+    reason,
+    source,
+    status,
+    created_at,
+    updated_at
+  ) VALUES (
+    @chatId,
+    @dueAt,
+    @requestedDelayMinutes,
+    @reason,
+    @source,
+    'pending',
+    @createdAt,
+    @updatedAt
+  )
+  ON CONFLICT(chat_id) DO UPDATE SET
+    due_at = excluded.due_at,
+    requested_delay_minutes = excluded.requested_delay_minutes,
+    reason = excluded.reason,
+    source = excluded.source,
+    status = 'pending',
+    created_at = excluded.created_at,
+    updated_at = excluded.updated_at
 `);
 
 const insertOutboundMessageStatement = db.prepare(`
@@ -193,12 +224,29 @@ const resetStaleBatchStatement = db.prepare(`
     AND updated_at <= @cutoff
 `);
 
+const resetStaleProactiveJobsStatement = db.prepare(`
+  UPDATE proactive_jobs
+  SET status = 'pending',
+      updated_at = @now
+  WHERE status = 'processing'
+    AND updated_at <= @cutoff
+`);
+
 const selectReadyBatchesStatement = db.prepare(`
   SELECT chat_id, process_after, last_message_at, status, updated_at
   FROM pending_batches
   WHERE status = 'pending'
     AND process_after <= @now
   ORDER BY process_after ASC
+  LIMIT @limit
+`);
+
+const selectDueProactiveJobsStatement = db.prepare(`
+  SELECT chat_id, due_at, requested_delay_minutes, reason, source, status, created_at, updated_at
+  FROM proactive_jobs
+  WHERE status = 'pending'
+    AND due_at <= @now
+  ORDER BY due_at ASC
   LIMIT @limit
 `);
 
@@ -209,6 +257,15 @@ const claimBatchStatement = db.prepare(`
   WHERE chat_id = @chatId
     AND status = 'pending'
     AND process_after <= @now
+`);
+
+const claimProactiveJobStatement = db.prepare(`
+  UPDATE proactive_jobs
+  SET status = 'processing',
+      updated_at = @now
+  WHERE chat_id = @chatId
+    AND status = 'pending'
+    AND due_at <= @now
 `);
 
 const selectPendingMessagesStatement = db.prepare(`
@@ -248,10 +305,24 @@ const completeBatchStatement = db.prepare(`
   WHERE chat_id = ?
 `);
 
+const deleteProactiveJobStatement = db.prepare(`
+  DELETE FROM proactive_jobs
+  WHERE chat_id = ?
+`);
+
 const rescheduleBatchStatement = db.prepare(`
   UPDATE pending_batches
   SET status = 'pending',
       process_after = @processAfter,
+      updated_at = @updatedAt
+  WHERE chat_id = @chatId
+`);
+
+const rescheduleProactiveJobStatement = db.prepare(`
+  UPDATE proactive_jobs
+  SET due_at = @dueAt,
+      requested_delay_minutes = @requestedDelayMinutes,
+      status = 'pending',
       updated_at = @updatedAt
   WHERE chat_id = @chatId
 `);
@@ -264,6 +335,11 @@ const pruneMessagesStatement = db.prepare(`
 const pruneBatchesStatement = db.prepare(`
   DELETE FROM pending_batches
   WHERE last_message_at < @cutoff
+`);
+
+const pruneProactiveJobsStatement = db.prepare(`
+  DELETE FROM proactive_jobs
+  WHERE updated_at < @cutoff
 `);
 
 const saveInboundMessageTransaction = db.transaction((payload, batchDelayMs) => {
@@ -292,6 +368,7 @@ const saveInboundMessageTransaction = db.transaction((payload, batchDelayMs) => 
     insertArtifacts(insertResult.lastInsertRowid, payload.artifacts, payload.occurredAt);
   }
 
+  deleteProactiveJobStatement.run(payload.chat.chatId);
   schedulePendingBatch(payload.chat.chatId, payload.occurredAt, batchDelayMs);
 
   return getMessageById(insertResult.lastInsertRowid);
@@ -347,6 +424,21 @@ function initializeSchema() {
       updated_at TEXT NOT NULL,
       FOREIGN KEY(chat_id) REFERENCES chats(chat_id)
     );
+
+    CREATE TABLE IF NOT EXISTS proactive_jobs (
+      chat_id TEXT PRIMARY KEY,
+      due_at TEXT NOT NULL,
+      requested_delay_minutes INTEGER,
+      reason TEXT,
+      source TEXT,
+      status TEXT NOT NULL CHECK(status IN ('pending', 'processing')),
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      FOREIGN KEY(chat_id) REFERENCES chats(chat_id) ON DELETE CASCADE
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_proactive_jobs_due_at
+      ON proactive_jobs (status, due_at);
 
     CREATE TABLE IF NOT EXISTS artifacts (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -489,11 +581,77 @@ function claimReadyBatches(limit = 10) {
   return claimed;
 }
 
+function scheduleProactiveJob({
+  chatId,
+  delayMinutes,
+  reason = '',
+  source = 'analysis'
+} = {}) {
+  const parsedDelayMinutes = Number.parseInt(delayMinutes, 10);
+
+  if (!chatId || Number.isNaN(parsedDelayMinutes) || parsedDelayMinutes < 1) {
+    return null;
+  }
+
+  const now = new Date();
+  const dueAt = new Date(now.getTime() + parsedDelayMinutes * 60 * 1000).toISOString();
+  const timestamp = now.toISOString();
+
+  upsertProactiveJobStatement.run({
+    chatId,
+    dueAt,
+    requestedDelayMinutes: parsedDelayMinutes,
+    reason,
+    source,
+    createdAt: timestamp,
+    updatedAt: timestamp
+  });
+
+  return {
+    chatId,
+    dueAt,
+    requestedDelayMinutes: parsedDelayMinutes,
+    reason,
+    source,
+    status: 'pending',
+    createdAt: timestamp,
+    updatedAt: timestamp
+  };
+}
+
+function claimDueProactiveJobs(limit = 10) {
+  resetStaleProactiveJobs();
+
+  const now = new Date().toISOString();
+  const rows = selectDueProactiveJobsStatement.all({ now, limit });
+  const claimed = [];
+
+  for (const row of rows) {
+    const claimResult = claimProactiveJobStatement.run({
+      chatId: row.chat_id,
+      now
+    });
+
+    if (claimResult.changes) {
+      claimed.push(mapProactiveJob(row));
+    }
+  }
+
+  return claimed;
+}
+
 function resetStaleBatches(staleBatchMs = DEFAULT_STALE_BATCH_MS) {
   const now = new Date().toISOString();
   const cutoff = new Date(Date.now() - staleBatchMs).toISOString();
 
   resetStaleBatchStatement.run({ now, cutoff });
+}
+
+function resetStaleProactiveJobs(staleJobMs = DEFAULT_STALE_PROACTIVE_JOB_MS) {
+  const now = new Date().toISOString();
+  const cutoff = new Date(Date.now() - staleJobMs).toISOString();
+
+  resetStaleProactiveJobsStatement.run({ now, cutoff });
 }
 
 function getPendingMessagesForChat(chatId) {
@@ -542,6 +700,11 @@ function completeBatch(chatId) {
   completeBatchStatement.run(chatId);
 }
 
+function deleteProactiveJob(chatId) {
+  const result = deleteProactiveJobStatement.run(chatId);
+  return Boolean(result.changes);
+}
+
 function rescheduleBatch(chatId, delayMs = 60 * 1000) {
   const updatedAt = new Date().toISOString();
   const processAfter = new Date(Date.now() + delayMs).toISOString();
@@ -553,11 +716,25 @@ function rescheduleBatch(chatId, delayMs = 60 * 1000) {
   });
 }
 
+function rescheduleProactiveJob(chatId, delayMs = 5 * 60 * 1000) {
+  const updatedAt = new Date().toISOString();
+  const dueAt = new Date(Date.now() + delayMs).toISOString();
+  const requestedDelayMinutes = Math.max(1, Math.ceil(delayMs / (60 * 1000)));
+
+  rescheduleProactiveJobStatement.run({
+    chatId,
+    dueAt,
+    requestedDelayMinutes,
+    updatedAt
+  });
+}
+
 function pruneExpiredData(retentionDays = getRetentionDays()) {
   const cutoff = new Date(Date.now() - retentionDays * 24 * 60 * 60 * 1000).toISOString();
 
   pruneMessagesStatement.run({ cutoff });
   pruneBatchesStatement.run({ cutoff });
+  pruneProactiveJobsStatement.run({ cutoff });
 }
 
 function getRuntimeInfo() {
@@ -647,6 +824,19 @@ function mapBatch(row) {
   };
 }
 
+function mapProactiveJob(row) {
+  return {
+    chatId: row.chat_id,
+    dueAt: row.due_at,
+    requestedDelayMinutes: row.requested_delay_minutes,
+    reason: row.reason || '',
+    source: row.source || '',
+    status: row.status,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at
+  };
+}
+
 function mapMessage(row) {
   return {
     id: row.id,
@@ -701,8 +891,10 @@ function safeJsonParse(value) {
 }
 
 module.exports = {
+  claimDueProactiveJobs,
   claimReadyBatches,
   completeBatch,
+  deleteProactiveJob,
   getActiveChats,
   getAppState,
   getLastTelegramUpdateId,
@@ -711,9 +903,11 @@ module.exports = {
   getRuntimeInfo,
   markMessagesProcessed,
   pruneExpiredData,
+  rescheduleProactiveJob,
   rescheduleBatch,
   saveInboundMessage,
   saveOutboundMessage,
+  scheduleProactiveJob,
   setAppState,
   setLastTelegramUpdateId
 };

@@ -1,19 +1,21 @@
 # Personal Telegram Bot System Flow
 
-This document describes how the current bot runtime moves data from Telegram into local persistence, enriches it with GitLab activity, sends multimodal context to OpenRouter, and optionally replies back to Telegram. It also includes a user-journey view so the batching behavior is easier to understand from the chat side.
+This document describes the current runtime as implemented in the codebase today. The bot ingests Telegram messages into SQLite, groups nearby inbound messages into batches, enriches prompt context with GitLab activity and retained chat history, asks OpenRouter for both an immediate reply decision and a future follow-up decision, and optionally delivers the result back to Telegram as text or as a native voice note.
 
 ## Runtime Overview
 
 The runtime is a cron-driven Node.js process started from `index.js`.
 
-- `index.js` schedules three loops: Telegram ingestion, pending-batch processing, and proactive wellbeing evaluation.
-- `services/telegram.js` fetches Telegram updates, normalizes messages, downloads file-backed media when needed, and sends replies.
-- `services/persistence.js` stores chats, messages, artifacts, pending batches, and the last processed Telegram update id in SQLite.
-- `services/storage.js` archives media to Azure Blob Storage and generates read URLs for model inputs.
-- `services/context.js` formats recent conversation history and current-batch messages into prompt-friendly text.
+- `index.js` schedules two loops: Telegram ingestion and a shared processing worker.
+- `services/telegram.js` fetches Telegram updates, normalizes inbound messages, downloads file-backed media when needed, and sends outbound text or voice replies.
+- `services/persistence.js` stores chats, messages, artifacts, pending batches, proactive follow-up jobs, and the last processed Telegram update id in SQLite.
+- `services/storage.js` archives media to Azure Blob Storage and generates read URLs for model inputs when possible.
+- `services/context.js` formats recent conversation history into prompt-friendly text.
 - `services/media.js` converts current-batch artifacts into OpenRouter content parts such as text, image, generic file, and inline audio.
 - `services/gitlab.js` fetches recent GitLab commits used as background context.
 - `services/openrouter.js` builds the final model request and parses the JSON response.
+- `services/speech.js` calls the OpenRouter speech endpoint and returns audio suitable for Telegram voice-note delivery after conversion.
+- `services/time.js` formats AI-facing timestamps as Indonesian local time strings in `WIB`.
 
 ## End-to-End Flow
 
@@ -21,8 +23,7 @@ The runtime is a cron-driven Node.js process started from `index.js`.
 flowchart TD
     A[Process start] --> B[Load env and runtime info]
     B --> C[Schedule Telegram ingest cron]
-    B --> D[Schedule batch processor cron]
-    B --> E2[Schedule proactive wellbeing cron]
+    B --> D[Schedule shared processing cron]
 
     C --> E[runIngestion]
     E --> F[Telegram getUpdates]
@@ -30,121 +31,142 @@ flowchart TD
     G --> H[Download Telegram media when present]
     H --> I[Archive artifacts to Azure Blob when configured]
     I --> J[Save inbound message, chat, artifacts]
-    J --> K[Upsert pending batch per chat]
+    J --> K[Delete pending proactive job for this chat]
+    K --> L[Upsert pending batch per chat]
 
-    D --> L[runPendingBatchProcessing]
-    L --> M[Prune expired rows]
-    M --> N[Claim ready chat batches]
-    N --> O[Fetch recent GitLab contributions]
-    O --> P[Load current pending messages]
-    P --> Q[Load 3-day message history]
-    Q --> R[Build multimodal current-batch content]
-    R --> S[Call OpenRouter]
-    S --> T{shouldText?}
-    T -->|yes| U[Send Telegram message]
-    T -->|no| V[Skip outbound reply]
-    U --> W[Persist outbound message]
-    V --> X[Mark batch messages processed]
-    W --> X
-    X --> Y[Complete batch]
+    D --> M[runPendingBatchProcessing]
+    M --> N[Prune expired rows]
+    N --> O[Claim ready chat batches]
+    N --> P[Claim due proactive jobs]
+    O --> Q[Fetch recent GitLab contributions once per tick]
+    P --> Q
 
-    E2 --> Z[runScheduledProactiveWellbeingChecks]
-    Z --> Z1[Load active chats in retention window]
-    Z1 --> Z2[Fetch recent GitLab contributions]
-    Z2 --> Z3[Skip chats with unchanged context fingerprint]
-    Z3 --> Z4[Call OpenRouter with history and no current batch]
-    Z4 --> Z5{shouldText?}
-    Z5 -->|yes| Z6[Send proactive Telegram message]
-    Z5 -->|no| Z7[Persist proactive fingerprint only]
+    Q --> R[Batch path: load current pending messages]
+    R --> S[Load retained history]
+    S --> T[Build multimodal current-batch content]
+    T --> U[Call OpenRouter]
+    U --> V[Parse shouldText, mood, and followUp]
+    V --> W{shouldText?}
+    W -->|yes| X[Send Telegram text or voice reply]
+    W -->|no| Y[Skip outbound reply]
+    X --> Z[Persist outbound message]
+    Y --> AA[Mark batch messages processed]
+    Z --> AA
+    AA --> AB[Complete batch]
+    AB --> AC[Upsert or clear proactive job from followUp]
+
+    Q --> AD[Proactive path: verify no pending inbound batch]
+    AD --> AE[Load retained history]
+    AE --> AF[Call OpenRouter with history and scheduling context]
+    AF --> AG[Parse shouldText, mood, and followUp]
+    AG --> AH{shouldText?}
+    AH -->|yes| AI[Send Telegram text or voice reply]
+    AH -->|no| AJ[Skip outbound reply]
+    AI --> AK[Persist outbound message]
+    AJ --> AL[Continue without outbound]
+    AK --> AM[Upsert or clear proactive job from followUp]
+    AL --> AM
 ```
 
-  ## User Journey
+## User Journey
 
-  This section explains the same system from the user's point of view instead of the service point of view.
+This section describes the same runtime from the user's point of view instead of the service point of view.
 
-  ```mermaid
-  sequenceDiagram
-     actor User
-     participant Telegram
-     participant Ingest as Ingest Cron
-     participant DB as SQLite
-    participant Process as Batch Processor Cron
-    participant Proactive as Proactive Cron
-     participant AI as OpenRouter
+```mermaid
+sequenceDiagram
+    actor User
+    participant Telegram
+    participant Ingest as Ingest Cron
+    participant DB as SQLite
+    participant Process as Shared Processing Cron
+    participant AI as OpenRouter
 
-     User->>Telegram: Send message or file
-     Ingest->>Telegram: Poll getUpdates
-     Ingest->>DB: Save inbound message and artifacts
-     Ingest->>DB: Set process_after = now + batch delay
+    User->>Telegram: Send message or file
+    Ingest->>Telegram: Poll getUpdates
+    Ingest->>DB: Save inbound message and artifacts
+    Ingest->>DB: Delete pending proactive job for that chat
+    Ingest->>DB: Set process_after = now + batch delay
 
-     User->>Telegram: Send another message before delay expires
-     Ingest->>DB: Save next message
-     Ingest->>DB: Move process_after forward again
+    User->>Telegram: Send another message before delay expires
+    Ingest->>DB: Save next message
+    Ingest->>DB: Move process_after forward again
 
-     Note over DB: The bot waits until the user goes quiet long enough
+    Note over DB: The bot waits until the user goes quiet long enough
 
-     Process->>DB: Claim ready batch after process_after
-     Process->>DB: Load current batch + recent history
-     Process->>AI: Send GitLab JSON + history + current batch + artifacts
-     AI-->>Process: JSON decision
-     Process->>Telegram: Send reply when shouldText is true
-     Process->>DB: Save outbound message and mark batch complete
+    Process->>DB: Claim ready batch after process_after
+    Process->>DB: Load current batch + retained history
+    Process->>AI: Send GitLab JSON + history + current batch + artifacts
+    AI-->>Process: JSON decision with shouldText, mood, followUp
+    Process->>Telegram: Send reply when shouldText is true
+    Process->>DB: Save outbound message and mark batch complete
+    Process->>DB: Upsert or clear one proactive job for that chat
 
-      Proactive->>DB: Load recent chats with no pending batch work
-      Proactive->>AI: Send GitLab JSON + retained history only
-      AI-->>Proactive: JSON decision
-      Proactive->>Telegram: Send proactive reply only when shouldText is true
-  ```
+    Note over DB: Later, when due_at arrives, the same worker can claim that proactive job
 
-  ### What the user experiences
+    Process->>DB: Claim due proactive job
+    Process->>AI: Send GitLab JSON + retained history + scheduling context
+    AI-->>Process: JSON decision with shouldText, mood, followUp
+    Process->>Telegram: Send proactive reply only when shouldText is true
+    Process->>DB: Replace or clear the proactive job
 
-  #### Journey A: User sends one message
+    User->>Telegram: Send a fresh message before the next due_at
+    Ingest->>DB: Save inbound message
+    Ingest->>DB: Cancel the previously scheduled proactive job
+```
 
-  1. The user sends a message in Telegram.
-  2. The next ingest tick stores it in SQLite and opens or updates that chat's pending batch.
-  3. The bot does not answer immediately. It waits for the batch delay window to expire.
-  4. When the processing cron sees that the batch is ready, it builds the full AI request.
-  5. The request includes:
-    - the current unprocessed batch for that chat
-    - recent conversation history still inside the retention window
-    - recent GitLab contribution data
-    - any persisted artifacts that can be attached
-  6. The model decides whether to send a Telegram reply.
+### What the user experiences
 
-  #### Journey B: User sends several messages in a short burst
+#### Journey A: User sends one message
 
-  1. The first message starts a pending batch.
-  2. Each new message arriving before the delay expires pushes `process_after` forward.
-  3. The bot groups that burst into one AI call instead of replying message by message.
-  4. When the user stops long enough, the batch becomes ready.
-  5. The model then sees the entire unprocessed burst as the current batch, plus prior retained history and GitLab context.
+1. The user sends a message in Telegram.
+2. The next ingest tick stores it in SQLite and opens or updates that chat's pending batch.
+3. The bot does not answer immediately. It waits for the batch delay window to expire.
+4. When the processing cron sees that the batch is ready, it builds the full AI request.
+5. The request includes the current unprocessed batch, retained conversation history, recent GitLab contribution data, and any persisted artifacts that can be attached.
+6. The model decides whether to send a reply right now and whether to schedule a later follow-up.
 
-  #### Journey C: User keeps chatting without a quiet gap
+#### Journey B: User sends several messages in a short burst
 
-  1. The ingest cron keeps storing new inbound messages.
-  2. The pending batch keeps being updated, so processing is deferred.
-  3. No OpenRouter call is made until a processing tick finds that `process_after` has actually elapsed.
-  4. When that finally happens, the request contains the still-pending current batch and the recent retained history outside that batch.
+1. The first message starts a pending batch.
+2. Each new message arriving before the delay expires pushes `process_after` forward.
+3. The bot groups that burst into one AI call instead of replying message by message.
+4. When the user stops long enough, the batch becomes ready.
+5. The model sees the entire unprocessed burst as the current batch, plus prior retained history and GitLab context.
 
-  ### Key timing rule
+#### Journey C: The bot schedules a follow-up after replying
 
-  The processing cron and the proactive cron now have separate jobs.
+1. A batch or proactive analysis returns `followUp.shouldSchedule = true`.
+2. The server computes `due_at` from the returned `delayMinutes` and upserts one row in `proactive_jobs` for that chat.
+3. No extra cron is created. The normal processing worker will claim that job once it becomes due.
+4. If the user sends a fresh message before then, ingestion deletes that pending proactive job and starts a new reactive batch instead.
 
-  - `TELEGRAM_PROCESS_CRON` controls how often the reactive processor wakes up to handle ready user batches.
-  - `TELEGRAM_PROACTIVE_CRON` controls how often the bot considers initiating a message on its own.
-  - The batch delay controls how long a chat must stay quiet before reactive AI processing is allowed.
-  - Because of that split, the bot can stay responsive to fresh messages while being much slower and more human-like about unsolicited check-ins.
+#### Journey D: A scheduled proactive follow-up becomes due
 
-  ### Context included when a batch fires
+1. The shared processing worker claims the due proactive job.
+2. If there are new inbound messages waiting, the job is cleared so reactive processing wins.
+3. Otherwise the worker loads retained history, GitLab activity, and the stored scheduling reason.
+4. The model decides whether to proactively text now and whether another future follow-up should exist.
 
-  When a chat batch is finally processed, the model sees all of these inputs together:
+### Key timing rules
 
-  - the current batch of unprocessed inbound messages for that chat
-  - retained conversation history, currently 3 days by default
-  - GitLab contribution JSON for the configured lookback window
-  - multimodal artifact inputs when available
+- `TELEGRAM_POLL_CRON` controls how often inbound Telegram updates are fetched.
+- `TELEGRAM_PROCESS_CRON` controls how often the shared worker wakes up to process both ready user batches and due proactive jobs.
+- `TELEGRAM_BATCH_DELAY_MS` controls how long a chat must stay quiet before reactive AI processing is allowed.
+- The model returns `followUp.delayMinutes`, but the server computes the actual due timestamp in SQLite.
+- Only one proactive job can exist per chat at a time because `proactive_jobs.chat_id` is the primary key.
+- Fresh inbound activity cancels the pending proactive job for that same chat so scheduled outreach does not overlap with active conversation.
 
-  The current batch is removed from the history section before prompt assembly, so the same messages are not duplicated in both places.
+### Context included when a batch fires
+
+When a chat batch is processed, the model sees all of these inputs together:
+
+- the current batch of unprocessed inbound messages for that chat
+- retained conversation history, currently 3 days by default
+- GitLab contribution JSON for the configured lookback window
+- multimodal artifact inputs when available
+- the current Indonesian timestamp used as the prompt's time anchor
+
+The current batch is removed from the history section before prompt assembly, so the same messages are not duplicated in both places.
 
 ## Detailed Flow
 
@@ -154,9 +176,8 @@ At startup, `index.js` loads environment variables, opens the SQLite runtime dat
 
 - `TELEGRAM_POLL_CRON` defaults to `* * * * *`.
 - `TELEGRAM_PROCESS_CRON` defaults to `* * * * *`.
-- `TELEGRAM_PROACTIVE_CRON` defaults to `*/30 * * * *`.
 - The runtime database defaults to `.runtime/personal-telegram-bot.sqlite`.
-- Simple in-memory guards prevent overlapping ingest and processing runs in the same process.
+- Simple in-memory guards prevent overlapping ingest runs and overlapping processing runs in the same process.
 
 ### 2. Telegram Ingestion
 
@@ -168,6 +189,7 @@ Each ingest tick runs `ingestUpdates(batchDelayMs)`.
 4. Only message updates are considered.
 5. If `TELEGRAM_USERNAME` is configured, only messages from or for that username are tracked.
 6. Each tracked update is normalized into a consistent internal message shape.
+7. Saving an inbound message also deletes any pending proactive job for that chat and upserts the delayed batch row.
 
 Normalized message fields include:
 
@@ -193,11 +215,11 @@ When an inbound Telegram message contains file-backed media, the ingest path ext
 
 Current storage behavior:
 
-- storage provider: Azure Blob Storage
+- storage provider: Azure Blob Storage when configured
 - default container name: `personal-experiment`
 - upload status examples: `uploaded`, `unconfigured`, `download_failed`, `upload_failed`
 
-### 4. Persistence and Batching
+### 4. Persistence and Queues
 
 The normalized inbound message is stored in SQLite by `saveInboundMessage(...)`.
 
@@ -207,53 +229,67 @@ Persistence currently keeps:
 - `chats` for chat metadata
 - `messages` for inbound and outbound conversation records
 - `artifacts` for persisted media metadata and archival state
-- `pending_batches` for per-chat delayed processing windows
+- `pending_batches` for per-chat delayed reactive processing windows
+- `proactive_jobs` for per-chat proactive follow-up scheduling
 
-Each saved inbound message updates a pending batch for its chat.
+Queue behavior:
 
-- The default batch delay is 2 minutes.
-- New messages push `process_after` forward so quick bursts are grouped into one AI call.
-- Outbound bot messages are also persisted, but they are marked processed immediately.
+- `pending_batches` groups nearby inbound user messages into one AI call.
+- `proactive_jobs` stores at most one active follow-up per chat, including `due_at`, `requested_delay_minutes`, `reason`, and `source`.
+- New inbound messages push `process_after` forward and delete that chat's pending proactive job.
+- Outbound bot messages are persisted immediately so later prompts include the bot's own conversation history.
 
-### 5. Pending Batch Processing
+### 5. Shared Processing Worker
 
 Each processing tick runs `runPendingBatchProcessing()`.
 
-1. Expired messages and stale batches are pruned first.
-2. Ready chat batches are claimed from SQLite so only pending windows whose `process_after` has elapsed are processed.
-3. Recent GitLab contributions are fetched once for the tick.
-4. For each claimed batch, the bot loads:
-   - current unprocessed inbound messages for that chat
-   - recent conversation history within the retention window
-5. If the batch has no pending messages left, it is completed and removed.
-6. Otherwise the bot assembles the AI request and asks OpenRouter whether it should reply.
+1. Expired data is pruned first.
+2. Ready chat batches are claimed from SQLite.
+3. Due proactive jobs are also claimed from SQLite.
+4. Recent GitLab contributions are fetched once for the whole tick.
+5. The worker then processes claimed batches and claimed proactive jobs separately.
 
-If a chat batch fails during processing, it is rescheduled instead of being dropped.
+If the whole tick fails unexpectedly, claimed work is rescheduled instead of being dropped.
 
-### 6. Proactive Wellbeing Processing
+### 6. Reactive Batch Path
 
-The proactive loop runs on its own cron instead of sharing the reactive batch processor schedule.
+For each claimed batch:
 
-1. Expired rows are pruned before evaluation.
-2. The bot loads chats with recent history inside the retention window.
-3. It fetches recent GitLab contributions for the tick.
-4. Chats with pending inbound batches are skipped so proactive outreach does not compete with reactive replies.
-5. Chats whose inbound-history-plus-contribution fingerprint has not changed are skipped.
-6. For the remaining chats, the bot calls OpenRouter with retained history and an empty current batch.
-7. If the model decides to text, the bot sends the proactive reply and then stores the latest context fingerprint.
+1. The worker loads current unprocessed inbound messages for that chat.
+2. If the batch is already empty, it completes the batch without calling the model.
+3. Otherwise it loads retained recent history for the chat.
+4. It builds multimodal current-batch content from text and artifacts.
+5. It calls OpenRouter and receives a JSON decision.
+6. If `shouldText` is true and `text` is non-empty, it sends the reply through Telegram.
+7. The current batch messages are marked processed and the pending batch row is deleted.
+8. The `followUp` decision is then used to upsert or clear the chat's proactive job.
 
-### 7. Prompt and Multimodal Assembly
+### 7. Proactive Follow-Up Path
+
+For each claimed proactive job:
+
+1. The worker checks whether new inbound messages are waiting for that chat.
+2. If a reactive batch is pending, the proactive job is cleared so the reactive path wins.
+3. If no retained history is available, the proactive job is cleared.
+4. Otherwise the worker calls OpenRouter with retained history, GitLab activity, and scheduling context describing why this follow-up exists.
+5. If `shouldText` is true and `text` is non-empty, it sends the proactive reply through Telegram.
+6. The `followUp` decision from that analysis replaces or clears the proactive job.
+
+### 8. Prompt and Multimodal Assembly
 
 The AI request is split into two major context sources.
 
-System prompt content:
+System prompt content includes:
 
 - GitLab activity as JSON
+- the current Indonesian date and time
+- scheduling context describing whether the call was triggered by a user batch or a due proactive follow-up
 - working schedule placeholder text
 - recent 3-day conversation history formatted as timestamped `user` and `assistant` lines
-- instructions to return only JSON with `shouldText` and `text`
+- an explicit rule that all timestamps shown to the model are already in Indonesian local time (`WIB`)
+- instructions to return only JSON with `shouldText`, `text`, `mood`, and `followUp`
 
-User message content:
+User content includes:
 
 - a text preface for the current batch
 - one formatted line per current-batch message
@@ -266,45 +302,59 @@ Artifact-to-model mapping in `services/media.js`:
 - audio and voice are downloaded from Telegram again at processing time and sent inline as binary `file` parts because OpenRouter audio inputs cannot use remote URLs
 - when an artifact cannot be attached, a text fallback is appended so the model still sees that the artifact existed
 
-### 8. OpenRouter Decision Step
+### 9. OpenRouter Decision Step
 
-`services/openrouter.js` sends the assembled request to OpenRouter using the `deepseek/deepseek-chat-v3.1` model.
+`services/openrouter.js` sends the assembled request to OpenRouter using the `google/gemini-3-flash-preview` chat model.
 
-Expected model output:
+Expected normalized model output:
 
 ```json
 {
   "shouldText": true,
-  "text": "Message to send back to Telegram"
+  "text": "Message to send back to Telegram",
+  "mood": "empathetic",
+  "followUp": {
+    "shouldSchedule": true,
+    "delayMinutes": 45,
+    "reason": "Check back later if the conversation stays quiet"
+  }
 }
 ```
 
-The bot strips any surrounding Markdown fences, parses the JSON, and uses `shouldText` to decide whether to respond.
+The bot strips any surrounding Markdown fences, parses the JSON, normalizes missing or malformed follow-up fields, and uses:
 
-### 9. Telegram Reply and Outbound Logging
+- `shouldText` and `text` to decide whether to send a reply now
+- `mood` to shape optional TTS delivery style
+- `followUp` to decide whether to create, replace, or clear a proactive job
 
-When the model decides to reply:
+### 10. Telegram Delivery and Outbound Logging
 
-1. `services/telegram.js` calls Telegram `sendMessage`.
-2. The sent message is normalized like other messages.
-3. The outbound message is saved in SQLite so later prompts include the bot's own conversation history.
-4. The just-processed inbound batch messages are marked with `processed_at`.
-5. The pending batch row is deleted.
+When the model decides to reply, `services/telegram.js` sends the message through `sendTelegramMessage(...)`.
+
+Outbound delivery behavior:
+
+- text replies use Telegram `sendMessage`
+- voice replies use the OpenRouter speech API, request PCM audio, convert it to Telegram-friendly OGG/Opus, and send it with `sendVoice`
+- delivery mode is selected by `TELEGRAM_VOICE_REPLY_CHANCE` unless explicitly overridden in code
+- outbound messages are normalized and persisted in SQLite so future prompts include the bot's own conversation history
+- voice replies persist the spoken transcript as `messages.text_content`
 
 When the model decides not to reply:
 
-1. No Telegram message is sent.
-2. The inbound messages are still marked processed.
-3. The pending batch row is deleted.
+- no Telegram message is sent
+- the batch is still completed when the trigger was a reactive batch
+- the proactive job is still replaced or cleared based on `followUp`
 
-## Retention and Recovery Behavior
+### 11. Retention and Recovery Behavior
 
 The persistence layer keeps a rolling history window.
 
 - default retention is 3 days
 - expired message rows are pruned during ingest and processing ticks
 - old pending batches are also pruned
+- old proactive jobs are pruned
 - stale `processing` batches are reset back to `pending` after a timeout so the system can recover from interrupted runs
+- stale `processing` proactive jobs are also reset back to `pending`
 
 ## External Integrations
 
@@ -313,6 +363,7 @@ The persistence layer keeps a rolling history window.
 - reads inbound updates via `getUpdates`
 - downloads media via `getFile` plus Telegram file URLs
 - sends outbound text via `sendMessage`
+- sends outbound native voice notes via `sendVoice`
 
 ### Azure Blob Storage
 
@@ -326,8 +377,9 @@ The persistence layer keeps a rolling history window.
 
 ### OpenRouter
 
-- receives the system prompt, recent history, current batch, and multimodal parts
-- returns a JSON decision describing whether the bot should text the user
+- receives the system prompt, recent history, current batch, scheduling context, and multimodal parts
+- returns a JSON decision describing whether the bot should text now and whether a future follow-up should be scheduled
+- provides the speech synthesis endpoint used for optional Telegram voice-note replies
 
 ## Important Runtime Configuration
 
@@ -335,18 +387,28 @@ The persistence layer keeps a rolling history window.
 - `TELEGRAM_USERNAME`: optional filter for tracked messages
 - `TELEGRAM_FETCH_LIMIT`: maximum updates requested per poll
 - `TELEGRAM_POLL_CRON`: ingest schedule
-- `TELEGRAM_PROCESS_CRON`: reactive batch-processing schedule
-- `TELEGRAM_PROACTIVE_CRON`: proactive wellbeing schedule
+- `TELEGRAM_PROCESS_CRON`: shared worker schedule for both reactive batches and proactive jobs
+- `TELEGRAM_BATCH_DELAY_MS`: quiet window before a pending chat batch becomes processable
+- `TELEGRAM_CHUNK_DELAY_MS`: delay between outbound chunks when a long reply is split
+- `TELEGRAM_VOICE_REPLY_CHANCE`: probability of sending a voice reply instead of text
 - `OPENROUTER_API_KEY`: required for AI calls
+- `OPENROUTER_TTS_MODEL`: speech model used for voice replies
+- `OPENROUTER_TTS_VOICE`: default speech voice
+- `OPENROUTER_TTS_RESPONSE_FORMAT`: speech format, currently `pcm`
+- `OPENROUTER_TTS_SPEED`: speech speed multiplier
 - `GITLAB_TOKEN`, `GITLAB_USERNAME`, `GITLAB_HOST`: GitLab integration settings
 - `GITLAB_LOOKBACK_DAYS`: contribution lookback window, default `1`
 - `AZURE_STORAGE_CONNECTION_STRING`: enables artifact upload and signed URLs
 - `AZURE_STORAGE_CONTAINER_NAME`: optional container override, default `personal-experiment`
+- `MESSAGE_RETENTION_DAYS`: retained history window, default `3`
 - `RUNTIME_DATA_DIR`: optional runtime directory override
+- `DEBUG_LOGS`: enables debug logging across scheduler, Telegram, GitLab, OpenRouter, and speech paths
 
 ## Current System Notes
 
-- Conversation history sent to the model excludes the current unprocessed batch so the same messages are not duplicated in both history and current inputs.
-- The model sees artifact summaries in the text history even when full multimodal attachment is unavailable.
-- Audio and voice are the only artifact types fetched inline from Telegram during processing; other uploaded artifacts are referenced through signed Azure URLs.
-- Structured Telegram types such as location, venue, contact, and poll are currently represented through text summaries rather than dedicated structured model parts.
+- Conversation history sent to the model excludes the current unprocessed batch so the same inbound messages are not duplicated in both history and current inputs.
+- AI-facing timestamps in conversation history and GitLab contribution data are formatted as `YYYY-MM-DD HH:mm:ss WIB`.
+- The system prompt always includes the current Indonesian date and time as an anchor so the model can reason about sleep, morning wakeups, and timeline order correctly.
+- Fresh inbound user activity cancels any pending proactive follow-up for that chat before a new reactive batch is scheduled.
+- Only one proactive follow-up row can exist per chat at a time, which prevents overlap and keeps rescheduling simple.
+- Optional voice replies use the analysis `mood` as speech-style guidance, not as the speech voice id itself.

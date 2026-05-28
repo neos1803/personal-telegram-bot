@@ -1,6 +1,8 @@
 require('dotenv').config();
+const { randomUUID } = require('crypto');
 const axios = require('axios');
 const { debugLog } = require('./debug');
+const { archiveRequestLog } = require('./storage');
 
 const DEFAULT_GEMINI_TTS_VOICE = 'Leda';
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
@@ -50,8 +52,13 @@ async function synthesizeSpeech({
   speed = OPENROUTER_TTS_SPEED,
   instructions = ''
 } = {}) {
+  const requestId = randomUUID();
+  const occurredAt = new Date().toISOString();
   const normalizedInput = String(input || '').trim();
   const resolvedVoice = resolveSpeechVoice({ model, voice });
+  const normalizedInstructions = String(instructions || '').trim();
+  let responseMetadata = null;
+  let loggedError = null;
 
   if (!normalizedInput) {
     throw new Error('OpenRouter speech synthesis requires non-empty input text');
@@ -68,17 +75,18 @@ async function synthesizeSpeech({
     payload.speed = speed;
   }
 
-  if (instructions) {
+  if (normalizedInstructions) {
     payload.provider = {
       options: {
         openai: {
-          instructions
+          instructions: normalizedInstructions
         }
       }
     };
   }
 
   debugLog('speech', 'Requesting speech synthesis', {
+    requestId,
     model,
     requestedVoice: voice,
     voice: resolvedVoice,
@@ -102,6 +110,7 @@ async function synthesizeSpeech({
     const audioBuffer = Buffer.from(response.data);
 
     debugLog('speech', 'Received speech synthesis audio', {
+      requestId,
       model,
       voice: resolvedVoice,
       responseFormat,
@@ -109,6 +118,12 @@ async function synthesizeSpeech({
       byteLength: audioBuffer.length,
       generationId: response.headers['x-generation-id'] || null
     });
+
+    responseMetadata = {
+      contentType: response.headers['content-type'] || getSpeechContentType(responseFormat),
+      byteLength: audioBuffer.length,
+      generationId: response.headers['x-generation-id'] || null
+    };
 
     return {
       audioBuffer,
@@ -121,8 +136,24 @@ async function synthesizeSpeech({
     };
   } catch (error) {
     const speechError = extractSpeechErrorMessage(error);
+    loggedError = serializeSpeechErrorForLog(error, speechError);
     console.error('Error calling OpenRouter speech API:', speechError);
     throw new Error(speechError);
+  } finally {
+    await persistSpeechRequestLog({
+      requestId,
+      occurredAt,
+      model,
+      requestedVoice: voice,
+      resolvedVoice,
+      responseFormat,
+      speed,
+      input: normalizedInput,
+      instructions: normalizedInstructions,
+      payload,
+      responseMetadata,
+      error: loggedError
+    });
   }
 }
 
@@ -174,6 +205,74 @@ function resolveSpeechVoice({ model = '', voice = '' } = {}) {
   });
 
   return fallbackVoice;
+}
+
+async function persistSpeechRequestLog({
+  requestId,
+  occurredAt,
+  model,
+  requestedVoice,
+  resolvedVoice,
+  responseFormat,
+  speed,
+  input,
+  instructions,
+  payload,
+  responseMetadata,
+  error
+}) {
+  try {
+    const logRecord = await archiveRequestLog({
+      category: 'request-logs/openrouter-speech',
+      filePrefix: 'speech-synthesis',
+      occurredAt,
+      content: {
+        requestId,
+        loggedAt: new Date().toISOString(),
+        service: 'openrouter-speech',
+        request: {
+          model,
+          requestedVoice,
+          resolvedVoice,
+          responseFormat,
+          speed,
+          input,
+          instructions,
+          payload
+        },
+        response: error
+          ? null
+          : responseMetadata,
+        error
+      }
+    });
+
+    debugLog('speech', 'Stored speech request log', {
+      requestId,
+      uploadStatus: logRecord.uploadStatus,
+      blobPath: logRecord.blobPath,
+      uploadError: logRecord.uploadError || null
+    });
+
+    if (logRecord.uploadStatus !== 'uploaded') {
+      console.error(`Speech request log upload failed for ${requestId}:`, logRecord.uploadError);
+    }
+  } catch (logError) {
+    console.error(`Error storing speech request log for ${requestId}:`, logError.message);
+  }
+}
+
+function serializeSpeechErrorForLog(error, normalizedMessage) {
+  if (!error) {
+    return null;
+  }
+
+  return {
+    name: error.name || 'Error',
+    message: normalizedMessage || error.message || 'Unknown error',
+    stack: error.stack || null,
+    status: error.response?.status || null
+  };
 }
 
 module.exports = {

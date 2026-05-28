@@ -1,5 +1,12 @@
 require('dotenv').config();
+const { randomUUID, webcrypto } = require('crypto');
 const path = require('path');
+
+// @typespec/ts-http-runtime expects a global `crypto` object during Azure requests.
+if (webcrypto && typeof global.crypto === 'undefined') {
+  global.crypto = webcrypto;
+}
+
 const {
   BlobSASPermissions,
   BlobServiceClient,
@@ -72,6 +79,66 @@ async function archiveArtifact({ descriptor, messageText = '', occurredAt, binar
     artifactRecord.uploadStatus = 'upload_failed';
     artifactRecord.uploadError = error.message;
     return artifactRecord;
+  }
+}
+
+async function archiveRequestLog({
+  category = 'request-logs',
+  filePrefix = 'request',
+  occurredAt,
+  content = null,
+  contentType = 'application/json'
+} = {}) {
+  const containerName = getContainerName();
+  const normalizedCategory = normalizeBlobCategory(category) || 'request-logs';
+  const safeFilePrefix = sanitizeSlug(filePrefix) || 'request';
+  const timestamp = new Date(occurredAt || Date.now());
+  const safeTimestamp = Number.isNaN(timestamp.getTime())
+    ? String(Date.now())
+    : timestamp.toISOString().replace(/[:.]/g, '-');
+  const derivedFileName = `${safeFilePrefix}--${safeTimestamp}--${randomUUID()}.json`;
+  const blobPath = buildBlobPath(timestamp, `${normalizedCategory}/${derivedFileName}`);
+  const binaryData = Buffer.isBuffer(content)
+    ? content
+    : Buffer.from(
+      typeof content === 'string'
+        ? content
+        : JSON.stringify(content ?? {}, null, 2),
+      'utf8'
+    );
+
+  const logRecord = {
+    storageProvider: STORAGE_PROVIDER,
+    containerName,
+    blobPath,
+    blobUrl: null,
+    uploadStatus: 'unconfigured',
+    uploadError: null,
+    contentType,
+    byteLength: binaryData.length
+  };
+
+  if (!isAzureBlobStorageConfigured()) {
+    logRecord.uploadError = 'AZURE_STORAGE_CONNECTION_STRING is not configured';
+    return logRecord;
+  }
+
+  try {
+    const containerClient = await getContainerClient();
+    const blockBlobClient = containerClient.getBlockBlobClient(blobPath);
+
+    await blockBlobClient.uploadData(binaryData, {
+      blobHTTPHeaders: { blobContentType: contentType }
+    });
+
+    logRecord.blobUrl = blockBlobClient.url;
+    logRecord.uploadStatus = 'uploaded';
+
+    return logRecord;
+  } catch (error) {
+    logRecord.uploadStatus = 'upload_failed';
+    logRecord.uploadError = error.message;
+    return logRecord;
   }
 }
 
@@ -151,6 +218,14 @@ function sanitizeSlug(value) {
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, '-')
     .replace(/^-+|-+$/g, '');
+}
+
+function normalizeBlobCategory(value) {
+  return String(value || '')
+    .split('/')
+    .map((segment) => sanitizeSlug(segment))
+    .filter(Boolean)
+    .join('/');
 }
 
 async function getContainerClient() {
@@ -280,6 +355,7 @@ const MIME_EXTENSION_MAP = {
 
 module.exports = {
   archiveArtifact,
+  archiveRequestLog,
   buildBlobPath,
   createSummarySlug,
   getArtifactAccessUrl,
