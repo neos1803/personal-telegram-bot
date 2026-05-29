@@ -191,8 +191,23 @@ The revival path exists for chats that have no active proactive chain but should
 - the chat still has retained message history inside `MESSAGE_RETENTION_DAYS`
 - no `pending_batches` row exists for that chat
 - no `proactive_jobs` row exists for that chat
-- the last retained message is older than `TELEGRAM_PROACTIVE_REVIVAL_SILENCE_MINUTES`
+- the last inbound human message is older than `TELEGRAM_PROACTIVE_REVIVAL_SILENCE_MINUTES`
 - the per-chat revival marker is missing or older than `TELEGRAM_PROACTIVE_REVIVAL_COOLDOWN_MINUTES`
+
+Inside the persistence layer, those two env values are converted into moving timestamp gates before the SQL runs:
+
+- `silenceCutoff = now - TELEGRAM_PROACTIVE_REVIVAL_SILENCE_MINUTES`
+- `revivalCooldownCutoff = now - TELEGRAM_PROACTIVE_REVIVAL_COOLDOWN_MINUTES`
+
+The revival candidate query then applies them like this:
+
+- `last_inbound_message_at <= silenceCutoff` means the user has been quiet long enough
+- `last_revival_checked_at <= revivalCooldownCutoff` means the system has waited long enough since the previous revival evaluation
+- if `last_revival_checked_at` is missing, the chat is treated as never having gone through revival before
+
+Important nuance: revival silence is measured from the last inbound human message, not from the bot's own last outbound reply. A recent bot message should not suppress a revival check if the user has still been silent long enough.
+
+The per-chat revival marker is stored in `app_state` under `proactive.revival.last_checked.<chatId>` and is updated after a proactive-style evaluation finishes, so a no-op revival does not immediately get re-claimed on the next worker tick.
 
 Each candidate is then claimed by inserting a `proactive_jobs` row with:
 
@@ -377,8 +392,8 @@ The runtime handles overlap and interrupted work in several layers.
 - `TELEGRAM_PROCESS_CRON`: shared worker schedule for reactive batches, due proactive jobs, and revival checks
 - `TELEGRAM_BATCH_DELAY_MS`: quiet window before a pending batch becomes processable
 - `TELEGRAM_PROACTIVE_SILENCE_FALLBACK_MINUTES`: minimum delay used by server-side hybrid fallback for unanswered proactive chains
-- `TELEGRAM_PROACTIVE_REVIVAL_SILENCE_MINUTES`: silence threshold before a chainless chat becomes eligible for a revival check
-- `TELEGRAM_PROACTIVE_REVIVAL_COOLDOWN_MINUTES`: minimum spacing between revival-style re-evaluations for the same chat
+- `TELEGRAM_PROACTIVE_REVIVAL_SILENCE_MINUTES`: how old the last inbound human message must be before a chainless chat becomes eligible for a revival check
+- `TELEGRAM_PROACTIVE_REVIVAL_COOLDOWN_MINUTES`: how old the `proactive.revival.last_checked.<chatId>` marker must be before another revival-style re-evaluation is allowed
 - `TELEGRAM_CHUNK_DELAY_MS`: delay between outbound chunks
 - `TELEGRAM_VOICE_REPLY_CHANCE`: probability of voice delivery instead of text
 - `OPENROUTER_API_KEY`: required for OpenRouter chat and speech calls

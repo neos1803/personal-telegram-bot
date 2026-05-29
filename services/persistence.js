@@ -251,7 +251,12 @@ const selectDueProactiveJobsStatement = db.prepare(`
 `);
 
 const selectRevivalCandidatesStatement = db.prepare(`
-  SELECT chats.chat_id, chats.username, chats.display_name, chats.chat_type, MAX(messages.occurred_at) AS last_message_at,
+  SELECT chats.chat_id, chats.username, chats.display_name, chats.chat_type,
+         MAX(messages.occurred_at) AS last_message_at,
+         MAX(CASE
+               WHEN messages.direction = 'inbound' AND messages.is_from_bot = 0
+               THEN messages.occurred_at
+             END) AS last_inbound_message_at,
          revival_state.value AS last_revival_checked_at
   FROM chats
   INNER JOIN messages ON messages.chat_id = chats.chat_id
@@ -263,9 +268,16 @@ const selectRevivalCandidatesStatement = db.prepare(`
     AND pending_batches.chat_id IS NULL
     AND proactive_jobs.chat_id IS NULL
   GROUP BY chats.chat_id, chats.username, chats.display_name, chats.chat_type, revival_state.value
-  HAVING MAX(messages.occurred_at) <= @silenceCutoff
+  HAVING MAX(CASE
+               WHEN messages.direction = 'inbound' AND messages.is_from_bot = 0
+               THEN messages.occurred_at
+             END) IS NOT NULL
+    AND MAX(CASE
+              WHEN messages.direction = 'inbound' AND messages.is_from_bot = 0
+              THEN messages.occurred_at
+            END) <= @silenceCutoff
     AND (revival_state.value IS NULL OR revival_state.value <= @revivalCooldownCutoff)
-  ORDER BY last_message_at ASC
+  ORDER BY last_inbound_message_at ASC
   LIMIT @limit
 `);
 
@@ -718,7 +730,7 @@ function claimRevivalProactiveJobs({
   const claimed = [];
 
   for (const row of rows) {
-    const reason = buildRevivalReason(row.last_message_at);
+    const reason = buildRevivalReason(row.last_inbound_message_at);
     const claimResult = claimRevivalProactiveJobStatement.run({
       chatId: row.chat_id,
       now: nowIso,
@@ -735,7 +747,8 @@ function claimRevivalProactiveJobs({
         status: 'processing',
         createdAt: nowIso,
         updatedAt: nowIso,
-        lastMessageAt: row.last_message_at
+        lastMessageAt: row.last_message_at,
+        lastInboundMessageAt: row.last_inbound_message_at
       });
     }
   }
