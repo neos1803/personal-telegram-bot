@@ -5,10 +5,12 @@ const { getRecentContributions } = require('./services/gitlab');
 const { analyzeContributions } = require('./services/openrouter');
 const {
   claimDueProactiveJobs,
+  claimRevivalProactiveJobs,
   claimReadyBatches,
   completeBatch,
   deleteProactiveJob,
   getRuntimeInfo,
+  markProactiveRevivalChecked,
   getPendingMessagesForChat,
   getRecentMessages,
   markMessagesProcessed,
@@ -25,6 +27,18 @@ const { formatIndonesianPromptTimestamp } = require('./services/time');
 const TELEGRAM_POLL_CRON = process.env.TELEGRAM_POLL_CRON || '* * * * *';
 const TELEGRAM_PROCESS_CRON = process.env.TELEGRAM_PROCESS_CRON || '* * * * *';
 const GITLAB_LOOKBACK_DAYS = Number.parseInt(process.env.GITLAB_LOOKBACK_DAYS ?? '1', 10);
+const TELEGRAM_PROACTIVE_SILENCE_FALLBACK_MINUTES = Number.parseInt(
+  process.env.TELEGRAM_PROACTIVE_SILENCE_FALLBACK_MINUTES ?? '60',
+  10
+);
+const TELEGRAM_PROACTIVE_REVIVAL_SILENCE_MINUTES = Number.parseInt(
+  process.env.TELEGRAM_PROACTIVE_REVIVAL_SILENCE_MINUTES ?? '1440',
+  10
+);
+const TELEGRAM_PROACTIVE_REVIVAL_COOLDOWN_MINUTES = Number.parseInt(
+  process.env.TELEGRAM_PROACTIVE_REVIVAL_COOLDOWN_MINUTES ?? '360',
+  10
+);
 
 let ingestionInProgress = false;
 let processingInProgress = false;
@@ -75,6 +89,10 @@ async function runPendingBatchProcessing() {
 
     const readyBatches = claimReadyBatches();
     const dueProactiveJobs = claimDueProactiveJobs();
+    const revivalProactiveJobs = claimRevivalProactiveJobs({
+      silenceMinutes: TELEGRAM_PROACTIVE_REVIVAL_SILENCE_MINUTES,
+      cooldownMinutes: TELEGRAM_PROACTIVE_REVIVAL_COOLDOWN_MINUTES
+    });
 
     for (const batch of readyBatches) {
       claimedBatchIds.add(batch.chatId);
@@ -84,12 +102,16 @@ async function runPendingBatchProcessing() {
       claimedProactiveJobIds.add(job.chatId);
     }
 
-    if (!readyBatches.length && !dueProactiveJobs.length) {
-      console.log('No pending chat batches or proactive jobs are ready yet.');
+    for (const job of revivalProactiveJobs) {
+      claimedProactiveJobIds.add(job.chatId);
+    }
+
+    if (!readyBatches.length && !dueProactiveJobs.length && !revivalProactiveJobs.length) {
+      console.log('No pending chat batches, proactive jobs, or revival checks are ready yet.');
       return;
     }
 
-    console.log(`Found ${readyBatches.length} chat batch(es) and ${dueProactiveJobs.length} proactive job(s) ready for processing.`);
+    console.log(`Found ${readyBatches.length} chat batch(es), ${dueProactiveJobs.length} proactive job(s), and ${revivalProactiveJobs.length} revival check(s) ready for processing.`);
 
     const contributions = await getRecentContributions(GITLAB_LOOKBACK_DAYS);
     console.log(`GitLab contribution count for this tick: ${contributions.length}`);
@@ -120,8 +142,9 @@ async function runPendingBatchProcessing() {
           analysisTrigger: 'batch'
         });
         logAnalysisDecision('batch', batch.chatId, analysis);
+        const sentBatchReply = Boolean(analysis?.shouldText && analysis?.text);
 
-        if (analysis?.shouldText && analysis?.text) {
+        if (sentBatchReply) {
           await sendTelegramMessage(batch.chatId, analysis.text, { ttsMood: analysis?.mood });
           console.log(`Sent batch-triggered reply to chat ${batch.chatId}.`);
         }
@@ -131,7 +154,8 @@ async function runPendingBatchProcessing() {
         applyFollowUpDecision({
           chatId: batch.chatId,
           analysis,
-          source: 'batch'
+          source: 'batch',
+          outboundSent: sentBatchReply
         });
         batchHandledChatIds.add(batch.chatId);
         claimedBatchIds.delete(batch.chatId);
@@ -142,9 +166,11 @@ async function runPendingBatchProcessing() {
       }
     }
 
-    for (const job of dueProactiveJobs) {
+    const proactiveJobsToProcess = [...dueProactiveJobs, ...revivalProactiveJobs];
+
+    for (const job of proactiveJobsToProcess) {
       if (batchHandledChatIds.has(job.chatId)) {
-        console.log(`Skipping due proactive job for chat ${job.chatId} because the batch processor already handled this chat this tick.`);
+        console.log(`Skipping proactive processing for chat ${job.chatId} because the batch processor already handled this chat this tick.`);
         claimedProactiveJobIds.delete(job.chatId);
         continue;
       }
@@ -172,28 +198,37 @@ async function runPendingBatchProcessing() {
           chatId: job.chatId,
           historyCount: historyMessages.length,
           dueAt: job.dueAt,
-          reason: job.reason
+          reason: job.reason,
+          source: job.source
         });
+
+        const analysisTrigger = job.source === 'revival_check'
+          ? 'revival_check'
+          : 'scheduled_follow_up';
 
         const analysis = await analyzeContributions({
           contributions,
           workingSchedule: '',
           historyMessages,
           currentBatch: [],
-          analysisTrigger: 'scheduled_follow_up',
+          analysisTrigger,
           scheduledFollowUp: job
         });
-        logAnalysisDecision('proactive', job.chatId, analysis);
+        logAnalysisDecision(job.source === 'revival_check' ? 'revival' : 'proactive', job.chatId, analysis);
+        const sentProactiveReply = Boolean(analysis?.shouldText && analysis?.text);
 
-        if (analysis?.shouldText && analysis?.text) {
+        if (sentProactiveReply) {
           await sendTelegramMessage(job.chatId, analysis.text, { ttsMood: analysis?.mood });
-          console.log(`Sent scheduled proactive reply to chat ${job.chatId}.`);
+          console.log(`Sent ${job.source === 'revival_check' ? 'revival-triggered' : 'scheduled proactive'} reply to chat ${job.chatId}.`);
         }
 
+        markProactiveRevivalChecked(job.chatId);
         applyFollowUpDecision({
           chatId: job.chatId,
           analysis,
-          source: 'scheduled_follow_up'
+          source: 'scheduled_follow_up',
+          scheduledFollowUp: job,
+          outboundSent: sentProactiveReply
         });
         claimedProactiveJobIds.delete(job.chatId);
       } catch (error) {
@@ -217,10 +252,79 @@ async function runPendingBatchProcessing() {
   }
 }
 
-function applyFollowUpDecision({ chatId, analysis, source }) {
+function applyFollowUpDecision({
+  chatId,
+  analysis,
+  source,
+  scheduledFollowUp = null,
+  outboundSent = false
+}) {
   const followUp = analysis?.followUp;
 
-  if (!followUp?.shouldSchedule || followUp.delayMinutes < 1) {
+  if (followUp?.shouldSchedule && followUp.delayMinutes >= 1) {
+    const scheduledJob = scheduleProactiveJob({
+      chatId,
+      delayMinutes: followUp.delayMinutes,
+      reason: followUp.reason,
+      source
+    });
+
+    if (!scheduledJob) {
+      return null;
+    }
+
+    const reasonSuffix = scheduledJob.reason
+      ? ` reason="${scheduledJob.reason}"`
+      : '';
+
+    console.log(
+      `Scheduled proactive follow-up for chat ${chatId} at ${formatIndonesianPromptTimestamp(scheduledJob.dueAt)} (${scheduledJob.requestedDelayMinutes} minute(s) from now).${reasonSuffix}`
+    );
+
+    return scheduledJob;
+  }
+
+  if (followUp?.stopChain && followUp.delayMinutes >= 1) {
+    const pausedJob = scheduleProactiveJob({
+      chatId,
+      delayMinutes: followUp.delayMinutes,
+      reason: followUp.reason || buildPausedChainReason(followUp.delayMinutes),
+      source: 'scheduled_follow_up_pause'
+    });
+
+    if (pausedJob) {
+      console.log(
+        `Paused proactive follow-up chain for chat ${chatId} until ${formatIndonesianPromptTimestamp(pausedJob.dueAt)} (${pausedJob.requestedDelayMinutes} minute(s) from now) based on AI stopChain=true.`
+      );
+
+      return pausedJob;
+    }
+  }
+
+  if (shouldScheduleHybridFallback({
+    analysis,
+    source,
+    scheduledFollowUp,
+    outboundSent
+  })) {
+    const fallbackDelayMinutes = getHybridFallbackDelayMinutes(scheduledFollowUp);
+    const fallbackJob = scheduleProactiveJob({
+      chatId,
+      delayMinutes: fallbackDelayMinutes,
+      reason: buildHybridFallbackReason(scheduledFollowUp, fallbackDelayMinutes),
+      source: 'scheduled_follow_up_fallback'
+    });
+
+    if (fallbackJob) {
+      console.log(
+        `Scheduled hybrid fallback follow-up for chat ${chatId} at ${formatIndonesianPromptTimestamp(fallbackJob.dueAt)} (${fallbackJob.requestedDelayMinutes} minute(s) from now) because the proactive chain is still unanswered.`
+      );
+
+      return fallbackJob;
+    }
+  }
+
+  if (!followUp?.stopChain) {
     const cleared = deleteProactiveJob(chatId);
 
     if (cleared) {
@@ -230,26 +334,54 @@ function applyFollowUpDecision({ chatId, analysis, source }) {
     return null;
   }
 
-  const scheduledJob = scheduleProactiveJob({
-    chatId,
-    delayMinutes: followUp.delayMinutes,
-    reason: followUp.reason,
-    source
-  });
+  const cleared = deleteProactiveJob(chatId);
 
-  if (!scheduledJob) {
-    return null;
+  if (cleared) {
+    console.log(`Stopped proactive follow-up chain for chat ${chatId} based on AI stopChain=true.`);
   }
 
-  const reasonSuffix = scheduledJob.reason
-    ? ` reason="${scheduledJob.reason}"`
-    : '';
+  return null;
+}
 
-  console.log(
-    `Scheduled proactive follow-up for chat ${chatId} at ${formatIndonesianPromptTimestamp(scheduledJob.dueAt)} (${scheduledJob.requestedDelayMinutes} minute(s) from now).${reasonSuffix}`
-  );
+function shouldScheduleHybridFallback({
+  analysis,
+  source,
+  scheduledFollowUp,
+  outboundSent
+}) {
+  if (source !== 'scheduled_follow_up' || !scheduledFollowUp || !outboundSent) {
+    return false;
+  }
 
-  return scheduledJob;
+  return !analysis?.followUp?.stopChain;
+}
+
+function getHybridFallbackDelayMinutes(scheduledFollowUp) {
+  const previousDelayMinutes = Number.parseInt(scheduledFollowUp?.requestedDelayMinutes, 10);
+  const configuredFallbackMinutes = Number.isNaN(TELEGRAM_PROACTIVE_SILENCE_FALLBACK_MINUTES)
+    || TELEGRAM_PROACTIVE_SILENCE_FALLBACK_MINUTES < 1
+    ? 60
+    : TELEGRAM_PROACTIVE_SILENCE_FALLBACK_MINUTES;
+
+  if (Number.isNaN(previousDelayMinutes) || previousDelayMinutes < 1) {
+    return configuredFallbackMinutes;
+  }
+
+  return Math.max(previousDelayMinutes, configuredFallbackMinutes);
+}
+
+function buildHybridFallbackReason(scheduledFollowUp, fallbackDelayMinutes) {
+  const previousReason = String(scheduledFollowUp?.reason || '').trim();
+
+  if (!previousReason) {
+    return `Continue the unanswered proactive chain with another check in about ${fallbackDelayMinutes} minutes.`;
+  }
+
+  return `Continue the unanswered proactive chain after the previous follow-up (${previousReason}) in about ${fallbackDelayMinutes} minutes.`;
+}
+
+function buildPausedChainReason(delayMinutes) {
+  return `Pause the proactive chain for about ${delayMinutes} minutes before checking again.`;
 }
 
 function logAnalysisDecision(mode, chatId, analysis) {
@@ -260,9 +392,10 @@ function logAnalysisDecision(mode, chatId, analysis) {
   const followUpPreview = analysis?.followUp?.shouldSchedule
     ? `${analysis.followUp.delayMinutes} minute(s)`
     : 'none';
+  const stopChainPreview = analysis?.followUp?.stopChain ? 'true' : 'false';
 
   console.log(
-    `[${mode}] AI decision for chat ${chatId}: shouldText=${shouldText} followUp=${followUpPreview} preview="${preview}"`
+    `[${mode}] AI decision for chat ${chatId}: shouldText=${shouldText} followUp=${followUpPreview} stopChain=${stopChainPreview} preview="${preview}"`
   );
 }
 

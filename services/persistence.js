@@ -250,6 +250,25 @@ const selectDueProactiveJobsStatement = db.prepare(`
   LIMIT @limit
 `);
 
+const selectRevivalCandidatesStatement = db.prepare(`
+  SELECT chats.chat_id, chats.username, chats.display_name, chats.chat_type, MAX(messages.occurred_at) AS last_message_at,
+         revival_state.value AS last_revival_checked_at
+  FROM chats
+  INNER JOIN messages ON messages.chat_id = chats.chat_id
+  LEFT JOIN pending_batches ON pending_batches.chat_id = chats.chat_id
+  LEFT JOIN proactive_jobs ON proactive_jobs.chat_id = chats.chat_id
+  LEFT JOIN app_state AS revival_state
+    ON revival_state.key = 'proactive.revival.last_checked.' || chats.chat_id
+  WHERE messages.occurred_at >= @retentionCutoff
+    AND pending_batches.chat_id IS NULL
+    AND proactive_jobs.chat_id IS NULL
+  GROUP BY chats.chat_id, chats.username, chats.display_name, chats.chat_type, revival_state.value
+  HAVING MAX(messages.occurred_at) <= @silenceCutoff
+    AND (revival_state.value IS NULL OR revival_state.value <= @revivalCooldownCutoff)
+  ORDER BY last_message_at ASC
+  LIMIT @limit
+`);
+
 const claimBatchStatement = db.prepare(`
   UPDATE pending_batches
   SET status = 'processing',
@@ -266,6 +285,37 @@ const claimProactiveJobStatement = db.prepare(`
   WHERE chat_id = @chatId
     AND status = 'pending'
     AND due_at <= @now
+`);
+
+const claimRevivalProactiveJobStatement = db.prepare(`
+  INSERT OR IGNORE INTO proactive_jobs (
+    chat_id,
+    due_at,
+    requested_delay_minutes,
+    reason,
+    source,
+    status,
+    created_at,
+    updated_at
+  )
+  SELECT @chatId,
+         @now,
+         0,
+         @reason,
+         'revival_check',
+         'processing',
+         @now,
+         @now
+  WHERE NOT EXISTS (
+          SELECT 1
+          FROM proactive_jobs
+          WHERE chat_id = @chatId
+        )
+    AND NOT EXISTS (
+          SELECT 1
+          FROM pending_batches
+          WHERE chat_id = @chatId
+        )
 `);
 
 const selectPendingMessagesStatement = db.prepare(`
@@ -640,6 +690,59 @@ function claimDueProactiveJobs(limit = 10) {
   return claimed;
 }
 
+function claimRevivalProactiveJobs({
+  limit = 10,
+  silenceMinutes = 24 * 60,
+  cooldownMinutes = 6 * 60,
+  retentionDays = getRetentionDays()
+} = {}) {
+  resetStaleProactiveJobs();
+
+  const now = new Date();
+  const nowIso = now.toISOString();
+  const retentionCutoff = new Date(
+    now.getTime() - retentionDays * 24 * 60 * 60 * 1000
+  ).toISOString();
+  const silenceCutoff = new Date(
+    now.getTime() - normalizePositiveMinutes(silenceMinutes, 24 * 60) * 60 * 1000
+  ).toISOString();
+  const revivalCooldownCutoff = new Date(
+    now.getTime() - normalizePositiveMinutes(cooldownMinutes, 6 * 60) * 60 * 1000
+  ).toISOString();
+  const rows = selectRevivalCandidatesStatement.all({
+    retentionCutoff,
+    silenceCutoff,
+    revivalCooldownCutoff,
+    limit
+  });
+  const claimed = [];
+
+  for (const row of rows) {
+    const reason = buildRevivalReason(row.last_message_at);
+    const claimResult = claimRevivalProactiveJobStatement.run({
+      chatId: row.chat_id,
+      now: nowIso,
+      reason
+    });
+
+    if (claimResult.changes) {
+      claimed.push({
+        chatId: row.chat_id,
+        dueAt: nowIso,
+        requestedDelayMinutes: 0,
+        reason,
+        source: 'revival_check',
+        status: 'processing',
+        createdAt: nowIso,
+        updatedAt: nowIso,
+        lastMessageAt: row.last_message_at
+      });
+    }
+  }
+
+  return claimed;
+}
+
 function resetStaleBatches(staleBatchMs = DEFAULT_STALE_BATCH_MS) {
   const now = new Date().toISOString();
   const cutoff = new Date(Date.now() - staleBatchMs).toISOString();
@@ -682,6 +785,11 @@ function getAppState(key) {
 
 function setAppState(key, value) {
   setState(key, value);
+}
+
+function markProactiveRevivalChecked(chatId, checkedAt = new Date().toISOString()) {
+  setState(getProactiveRevivalStateKey(chatId), checkedAt);
+  return checkedAt;
 }
 
 function markMessagesProcessed(messageIds) {
@@ -890,7 +998,26 @@ function safeJsonParse(value) {
   }
 }
 
+function getProactiveRevivalStateKey(chatId) {
+  return `proactive.revival.last_checked.${chatId}`;
+}
+
+function buildRevivalReason(lastMessageAt) {
+  return `Revival check because the chat has been silent since ${lastMessageAt}.`;
+}
+
+function normalizePositiveMinutes(value, fallbackValue) {
+  const parsedValue = Number.parseInt(value, 10);
+
+  if (Number.isNaN(parsedValue) || parsedValue < 1) {
+    return fallbackValue;
+  }
+
+  return parsedValue;
+}
+
 module.exports = {
+  claimRevivalProactiveJobs,
   claimDueProactiveJobs,
   claimReadyBatches,
   completeBatch,
@@ -901,6 +1028,7 @@ module.exports = {
   getPendingMessagesForChat,
   getRecentMessages,
   getRuntimeInfo,
+  markProactiveRevivalChecked,
   markMessagesProcessed,
   pruneExpiredData,
   rescheduleProactiveJob,

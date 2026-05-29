@@ -95,12 +95,18 @@ async function analyzeContributions({
           "followUp": {
             "shouldSchedule": boolean,
             "delayMinutes": integer,
-            "reason": string
+            "reason": string,
+            "stopChain": boolean
           }
         }
         Rules for followUp:
         - This followUp object decides whether another proactive follow-up job should be scheduled after this analysis.
         - If no future follow-up is needed, set shouldSchedule to false, delayMinutes to 0, and reason to an empty string.
+        - If you want to pause the proactive chain for a while and let it resume later, set shouldSchedule to false, stopChain to true, and delayMinutes to the number of minutes before the chain should wake up and evaluate again.
+        - Set stopChain to true with delayMinutes = 0 only when you intentionally want the proactive chain to end completely.
+        - When this analysis was triggered by a scheduled follow-up and the user still has not replied, prefer keeping the chain alive with another reasonable follow-up instead of silently ending it.
+        - When this analysis was triggered by a revival check, first decide whether restarting proactive outreach is warranted at all; it is acceptable to stay silent now and schedule a later check instead.
+        - If the user is probably asleep or the timing is bad, you may set shouldText to false now and use stopChain with a positive delayMinutes so the chain resumes at a better time such as morning.
         - If a future follow-up is needed, set shouldSchedule to true and delayMinutes to a positive integer number of minutes from now.
         - You may schedule a future follow-up even if shouldText is false right now.
         - Avoid scheduling another follow-up too soon after an active conversation unless there is a strong reason.
@@ -175,9 +181,21 @@ function formatContributionsForPrompt(contributions) {
 }
 
 function formatSchedulingContextForPrompt({ analysisTrigger = 'batch', scheduledFollowUp = null } = {}) {
+  if (analysisTrigger === 'revival_check' && scheduledFollowUp) {
+    return [
+      'This analysis was triggered by a revival check because no proactive chain is currently active and the chat has been silent long enough to re-evaluate.',
+      'There are no newly queued inbound user messages right now.',
+      scheduledFollowUp.reason
+        ? `The recorded revival reason for this check was: ${scheduledFollowUp.reason}`
+        : 'No previous revival reason was recorded.',
+      'Decide whether to restart proactive outreach now, stay silent, or schedule a better-timed future check.'
+    ].join(' ');
+  }
+
   if (analysisTrigger === 'scheduled_follow_up' && scheduledFollowUp) {
     return [
       'This analysis was triggered because a previously scheduled proactive follow-up is now due.',
+      'There have been no new inbound user messages since that follow-up was scheduled.',
       `That follow-up was scheduled for approximately ${formatIndonesianPromptTimestamp(scheduledFollowUp.dueAt)}.`,
       scheduledFollowUp.reason
         ? `The previously recorded reason for that follow-up was: ${scheduledFollowUp.reason}`
@@ -206,21 +224,28 @@ function normalizeAnalysisResult(parsedResult = {}) {
 function normalizeFollowUpDecision(followUp = {}) {
   const shouldSchedule = Boolean(followUp?.shouldSchedule);
   const delayMinutes = Number.parseInt(followUp?.delayMinutes, 10);
+  const normalizedDelayMinutes = Number.isNaN(delayMinutes) || delayMinutes < 1
+    ? 0
+    : delayMinutes;
+  const stopChain = Boolean(followUp?.stopChain);
+  const reason = typeof followUp?.reason === 'string'
+    ? followUp.reason.trim()
+    : '';
 
-  if (!shouldSchedule || Number.isNaN(delayMinutes) || delayMinutes < 1) {
+  if (!shouldSchedule) {
     return {
       shouldSchedule: false,
-      delayMinutes: 0,
-      reason: ''
+      delayMinutes: normalizedDelayMinutes,
+      reason,
+      stopChain
     };
   }
 
   return {
     shouldSchedule: true,
-    delayMinutes,
-    reason: typeof followUp?.reason === 'string'
-      ? followUp.reason.trim()
-      : ''
+    delayMinutes: normalizedDelayMinutes,
+    reason,
+    stopChain
   };
 }
 
